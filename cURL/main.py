@@ -3,8 +3,20 @@ from pathlib import Path
 from services.db_service import DatabaseService
 from services.http_service import HttpsService
 from services.measure_service import MeasureService
+from services.chart_service import ChartService
 from models.measure import Measure
 from utils.env import load_env
+
+
+def _build_chart_data(urls: list[str], measure_service: MeasureService) -> tuple[list[str], list[float]]:
+  x = urls
+  y = []
+  for url in urls:
+    measures = measure_service.filter({"url": url})
+    average = sum(item.timer for item in measures) / len(measures) if measures else 0
+    y.append(average)
+  return x, y
+
 
 def main():
   env = load_env()
@@ -14,6 +26,7 @@ def main():
 
   https_service = HttpsService(base_url=str(env.get("BASE_URL", "")))
   measure_service = MeasureService(connection)
+  chart_service = ChartService()
 
   measure_count = int(env.get("MEASURE_COUNT", 1))
   urls = env.get("URLS", [])
@@ -29,6 +42,9 @@ def main():
       str(Path.cwd() / "measure.csv"),
     )
     print(f"csv exported: {csv_path}")
+
+    x, y = _build_chart_data(urls, measure_service)
+    chart_service.histogram(x, y)
   finally:
     database_service.close()
 
