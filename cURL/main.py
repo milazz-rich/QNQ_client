@@ -1,0 +1,36 @@
+from pathlib import Path
+
+from services.db_service import DatabaseService
+from services.http_service import HttpsService
+from services.measure_service import MeasureService
+from models.measure import Measure
+from utils.env import load_env
+
+def main():
+  env = load_env()
+  database_service = DatabaseService(db_path=env.get("DB_NAME", "qnq.db"), tables=env.get("DB_TABLES", []))
+  database_service.init_tables()
+  connection = database_service.getConnection()
+
+  https_service = HttpsService(base_url=str(env.get("BASE_URL", "")))
+  measure_service = MeasureService(connection)
+
+  measure_count = int(env.get("MEASURE_COUNT", 1))
+  urls = env.get("URLS", [])
+
+  try:
+    for url in urls:
+      for _ in range(measure_count):
+        response_time_ms = https_service.measure(url)
+        measure_service.insert(Measure(url=url, timer=response_time_ms))
+        print(f"saved measure url={url} time={response_time_ms}ms")
+    csv_path = database_service.export_csv(
+      "measure",
+      str(Path.cwd() / "measure.csv"),
+    )
+    print(f"csv exported: {csv_path}")
+  finally:
+    database_service.close()
+
+if __name__ == "__main__":
+  main()
