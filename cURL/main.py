@@ -8,6 +8,14 @@ from models.measure import Measure
 from utils.env import load_env
 
 
+def _to_bool(value: object, default: bool = False) -> bool:
+  if isinstance(value, bool):
+    return value
+  if value is None:
+    return default
+  return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _build_chart_data(urls: list[str], measure_service: MeasureService) -> tuple[list[str], list[float]]:
   x = urls
   y = []
@@ -29,14 +37,18 @@ def main():
   chart_service = ChartService()
 
   measure_count = int(env.get("MEASURE_COUNT", 1))
+  run_measurements = _to_bool(env.get("RUN_MEASUREMENTS", True), default=True)
+  use_quic = _to_bool(env.get("USE_QUIC", False), default=False)
   urls = env.get("URLS", [])
 
   try:
-    for url in urls:
-      for _ in range(measure_count):
-        response_time_ms = https_service.measure(url)
-        measure_service.insert(Measure(url=url, timer=response_time_ms))
-        print(f"saved measure url={url} time={response_time_ms}ms")
+    if run_measurements:
+      for url in urls:
+        for _ in range(measure_count):
+          response_time_ms = https_service.measure(url, use_quic)
+          measure_service.insert(Measure(url=url, timer=response_time_ms, quic=use_quic))
+          print(f"saved measure url={url} time={response_time_ms}ms quic={use_quic}")
+
     csv_path = database_service.export_csv(
       "measure",
       str(Path.cwd() / "measure.csv"),
