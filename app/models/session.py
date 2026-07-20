@@ -10,11 +10,17 @@ from app.models.target import Protocol
 
 
 class RunStatus(StrEnum):
-    """Stato di avanzamento di una sessione o di un suo item."""
+    """Stato di avanzamento di una sessione o di un suo item.
+
+    ``FAILED`` si applica solo a ``SessionProgressItem.status``: una sessione
+    nel suo complesso arriva sempre a ``COMPLETED`` (§5.1 di AGENTS.md), è il
+    singolo item a poter risultare mai misurato.
+    """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class SessionProgressItem(MongoModel):

@@ -11,7 +11,6 @@ import logging
 from dataclasses import dataclass
 
 from app.core.config import settings
-from app.models.session_item import ConnectionMode
 from app.models.target import Protocol
 
 logger = logging.getLogger(__name__)
@@ -100,7 +99,6 @@ def build_command(
     url: str,
     protocol: Protocol,
     timeout_ms: int,
-    conn: ConnectionMode,
 ) -> list[str]:
     """Costruisce la riga di comando di curl per una singola misurazione.
 
@@ -108,7 +106,6 @@ def build_command(
         url: l'URL da richiedere.
         protocol: il protocollo da forzare.
         timeout_ms: timeout della richiesta in millisecondi.
-        conn: politica di connessione del ``SessionItem``.
 
     Restituisce:
         La lista di argomenti da passare a ``asyncio.create_subprocess_exec``.
@@ -116,13 +113,15 @@ def build_command(
     Fa:
         Scarta il corpo della risposta (``-o /dev/null``) per non falsare i
         tempi con la scrittura su disco, silenzia la progress bar (``-s``) e
-        chiede i timing tramite il template ``-w``. Con ``conn=new`` aggiunge
-        ``--no-keepalive``, che impedisce il riuso della connessione TCP/QUIC.
-        Gli argomenti sono passati come lista, mai come stringa di shell: host e
-        path arrivano dal database e non devono poter essere interpretati come
-        comandi.
+        chiede i timing tramite il template ``-w``. Aggiunge sempre
+        ``--no-keepalive``: ogni ripetizione è comunque un processo curl
+        separato (nessuna connessione sopravvive fra un processo e l'altro), il
+        flag rende esplicito che ogni misura è sempre "a freddo", invece di
+        lasciare intendere un riuso che non può avvenire. Gli argomenti sono
+        passati come lista, mai come stringa di shell: host e path arrivano dal
+        database e non devono poter essere interpretati come comandi.
     """
-    command = [
+    return [
         settings.curl_path,
         "-s",
         "-S",
@@ -133,11 +132,9 @@ def build_command(
         f"{timeout_ms / 1000:.3f}",
         "-w",
         _WRITE_OUT,
+        "--no-keepalive",
+        url,
     ]
-    if conn is ConnectionMode.NEW:
-        command.append("--no-keepalive")
-    command.append(url)
-    return command
 
 
 def _parse_write_out(raw: str) -> dict[str, object]:
@@ -230,7 +227,6 @@ async def measure(
     url: str,
     protocol: Protocol,
     timeout_ms: int,
-    conn: ConnectionMode,
 ) -> CurlMeasurement:
     """Esegue una singola misurazione invocando il binario curl.
 
@@ -238,7 +234,6 @@ async def measure(
         url: l'URL da richiedere.
         protocol: il protocollo da forzare (``--http2`` o ``--http3``).
         timeout_ms: timeout della richiesta in millisecondi, dal ``SessionItem``.
-        conn: politica di connessione del ``SessionItem``.
 
     Restituisce:
         Un ``CurlMeasurement``: mai un'eccezione per un fallimento di rete, così
@@ -253,7 +248,7 @@ async def measure(
         sessione. Se il timeout esterno scatta, il processo viene terminato e
         atteso, per non lasciare processi zombie.
     """
-    command = build_command(url, protocol, timeout_ms, conn)
+    command = build_command(url, protocol, timeout_ms)
     process_timeout = (timeout_ms + settings.curl_kill_grace_ms) / 1000
 
     try:

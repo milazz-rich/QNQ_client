@@ -1,17 +1,8 @@
 """Modelli dell'entità SessionItem: l'unità di lavoro configurata."""
 
-from enum import StrEnum
-
 from pydantic import Field
 
 from app.models.common import MongoDocument, MongoId, MongoModel
-
-
-class ConnectionMode(StrEnum):
-    """Politica di gestione della connessione fra ripetizioni."""
-
-    REUSE = "reuse"
-    NEW = "new"
 
 
 class SessionItemBase(MongoModel):
@@ -21,10 +12,6 @@ class SessionItemBase(MongoModel):
     scenario_id: MongoId = Field(alias="scenarioId", description="Scenario da eseguire")
     client_id: MongoId = Field(alias="clientId", description="Client che esegue la misura")
     reps: int = Field(ge=1, description="Numero di ripetizioni della misura")
-    conn: ConnectionMode = Field(
-        default=ConnectionMode.REUSE,
-        description="Se riusare la connessione o aprirne una nuova per ogni ripetizione",
-    )
     timeout: int = Field(ge=1, description="Timeout della singola richiesta in millisecondi")
 
 
@@ -39,7 +26,6 @@ class SessionItemUpdate(MongoModel):
     scenario_id: MongoId | None = Field(default=None, alias="scenarioId")
     client_id: MongoId | None = Field(default=None, alias="clientId")
     reps: int | None = Field(default=None, ge=1)
-    conn: ConnectionMode | None = None
     timeout: int | None = Field(default=None, ge=1)
 
 

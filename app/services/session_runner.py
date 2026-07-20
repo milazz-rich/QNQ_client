@@ -10,8 +10,10 @@ HTTP/3, che è l'unica cosa che questa applicazione deve misurare.
 """
 
 import logging
+from datetime import UTC, datetime
 
 from app.core.errors import AppError
+from app.models.result import ResultCreate, ResultStatus
 from app.models.session import RunStatus, Session, SessionProgressItem
 from app.services import results_service, session_items_service, sessions_service
 from app.services.measurement import runner as measurement_runner
@@ -63,15 +65,20 @@ async def _run_items(session: Session) -> None:
     Fa:
         Per ogni item aggiorna ``currentIndex``, lo porta in ``running``, esegue
         le ripetizioni e lo chiude in ``completed``. Un item che fallisce in
-        modo irrecuperabile (riferimento rotto, client non supportato) viene
-        marcato ``completed`` e l'esecuzione prosegue con il successivo: una
-        configurazione sbagliata su un item non deve invalidare l'intera sessione.
+        modo irrecuperabile (riferimento rotto, client non supportato) non è mai
+        stato misurato: viene marcato ``failed`` (non ``completed``, per non
+        farlo contare come dato valido), viene comunque salvato un ``Result``
+        con ``status="failed"`` così il fallimento resta tracciato invece di
+        sparire silenziosamente, e l'esecuzione prosegue con il successivo —
+        una configurazione sbagliata su un item non deve invalidare l'intera
+        sessione.
     """
     for index, item in enumerate(session.items):
         await sessions_service.set_current_index(session.id, index)
         await sessions_service.update_item_progress(
             session.id, index, status=RunStatus.RUNNING, done=0
         )
+        final_status = RunStatus.COMPLETED
         try:
             await _run_single_item(session.id, index, item)
         except AppError as exc:
@@ -82,12 +89,47 @@ async def _run_items(session: Session) -> None:
                 exc.code,
                 exc.message,
             )
-        except Exception:
+            final_status = RunStatus.FAILED
+            await results_service.create_result(_skipped_item_result(item, exc.message))
+        except Exception as exc:
             logger.exception("Item %d della sessione %s interrotto", index, session.id)
+            final_status = RunStatus.FAILED
+            await results_service.create_result(_skipped_item_result(item, str(exc)))
         finally:
-            await sessions_service.update_item_progress(
-                session.id, index, status=RunStatus.COMPLETED
-            )
+            await sessions_service.update_item_progress(session.id, index, status=final_status)
+
+
+def _skipped_item_result(item: SessionProgressItem, reason: str) -> ResultCreate:
+    """Costruisce il ``Result`` segnaposto per un item mai misurato.
+
+    Riceve:
+        item: l'item di avanzamento saltato, prima di qualunque ripetizione.
+        reason: messaggio dell'errore che ha impedito la misura.
+
+    Restituisce:
+        Un ``ResultCreate`` con ``status="failed"``, tempi a zero e
+        ``actualProto="unknown"``, coerente con come ``measurement.runner``
+        rappresenta un fallimento di misura.
+
+    Fa:
+        Non ha un ``Target``/``Scenario`` risolti a disposizione (l'errore può
+        derivare proprio dalla loro risoluzione), quindi usa ``item.label`` e il
+        messaggio d'errore come snapshot leggibili al posto dei campi
+        denormalizzati abituali.
+    """
+    return ResultCreate(
+        sessionItemId=item.session_item_id,
+        idx=item.done,
+        target=item.label,
+        scenarioPath=f"(non eseguito: {reason})",
+        proto=item.proto,
+        actualProto="unknown",
+        total=0.0,
+        ttfb=0.0,
+        kb=0.0,
+        status=ResultStatus.FAILED,
+        time=datetime.now(UTC),
+    )
 
 
 async def _run_single_item(session_id: str, index: int, item: SessionProgressItem) -> None:

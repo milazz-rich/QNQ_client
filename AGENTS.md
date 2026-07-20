@@ -183,7 +183,6 @@ Unità di lavoro configurata: "misura *questo* scenario su *questo* target".
 | `scenarioId` | `str`               | riferimento a `scenarios._id`        |
 | `clientId`   | `str`               | riferimento a `clients._id`          |
 | `reps`       | `int`               | ≥ 1, numero di ripetizioni           |
-| `conn`       | `"reuse" \| "new"`  | riuso connessione o nuova per rep    |
 | `timeout`    | `int`               | ms, ≥ 1                              |
 
 #### Session — collezione `sessions`
@@ -208,7 +207,7 @@ Esecuzione di un insieme ordinato di `SessionItem`.
 | `proto`         | `"HTTP/2" \| "HTTP/3"`              | protocollo richiesto           |
 | `total`         | `int`                               | ≥ 0, ripetizioni previste      |
 | `done`          | `int`                               | ≥ 0, ≤ `total`                 |
-| `status`        | `"pending"\|"running"\|"completed"` | stato dell'item                |
+| `status`        | `"pending"\|"running"\|"completed"\|"failed"` | stato dell'item; `failed` = mai misurato (config rotta) |
 
 #### Result — collezione `results`
 
@@ -399,6 +398,9 @@ POST /api/sessions/{id}/start
         per ogni ripetizione:
           curl → Result salvato → item.done += 1
         item.status = completed
+        (se la risoluzione o l'esecuzione falliscono in modo irrecuperabile:
+         item.status = failed, viene comunque salvato un Result "failed"
+         segnaposto — vedi §5.4)
       status = completed
 ```
 
@@ -413,7 +415,7 @@ frontend su `GET /api/sessions/{id}` di mostrare l'avanzamento in tempo reale.
 ### 5.2 Comando curl
 
 ```
-<curl> -s -S -o /dev/null (--http2|--http3) --max-time <timeout> -w <json> [--no-keepalive] <url>
+<curl> -s -S -o /dev/null (--http2|--http3) --max-time <timeout> -w <json> --no-keepalive <url>
 ```
 
 * L'URL è sempre `https://host:port/path`: HTTP/3 richiede TLS per definizione
@@ -422,8 +424,26 @@ frontend su `GET /api/sessions/{id}` di mostrare l'avanzamento in tempo reale.
 * `-w` produce una riga JSON con `http_version`, `response_code`, `time_total`,
   `time_starttransfer`, `size_download`. curl riporta secondi e byte; il modello
   `Result` usa **millisecondi e kilobyte**, la conversione è in `_to_measurement`.
+* `--no-keepalive` è **sempre** presente, incondizionatamente: ogni ripetizione
+  è un'invocazione di `curl` a sé stante (un processo per rep), quindi non
+  esiste connessione da riusare fra una ripetizione e l'altra. Il flag rende
+  esplicito nella riga di comando ciò che è già vero nei fatti — vedi la nota
+  metodologica sotto — invece di lasciarlo implicito. Per questo motivo
+  `SessionItem` **non ha un campo `conn`**: la scelta fra "riusa connessione" e
+  "nuova connessione per rep" non esiste nella pratica attuale, quindi non è
+  stata modellata.
 * Gli argomenti sono passati come **lista**, mai come stringa di shell: host e
   path arrivano dal database e non devono poter essere interpretati come comandi.
+
+**Nota metodologica.** Ogni misura include **sempre** l'overhead completo di
+handshake (TCP/QUIC + TLS) perché non c'è mai riuso di connessione fra
+ripetizioni: la ripetizione N+1 non eredita nulla dalla N, essendo un processo
+`curl` distinto. Chi legge i `Result` per confrontare HTTP/2 e HTTP/3 deve
+tenerne conto: `total` e `ttfb` misurano sempre una connessione "a freddo", non
+il caso (spesso più realistico in produzione) di richieste su una connessione
+già aperta. Questo è coerente fra i due protocolli — nessuno dei due beneficia
+di riuso — quindi non falsa il confronto relativo, ma va ricordato se questi
+numeri vengono confrontati con misure esterne che invece riusano la connessione.
 
 ### 5.3 Fallback di protocollo
 
@@ -457,19 +477,15 @@ Una misura fallita non interrompe mai l'esecuzione: produce un `Result` con
   ucciso e atteso, per non lasciare zombie né bloccare la sessione.
 
 Allo stesso modo, un item con configurazione rotta (riferimento inesistente,
-client non supportato) viene registrato nei log, marcato `completed` e saltato:
-una configurazione sbagliata su un item non deve invalidare l'intera sessione.
-
-### 5.5 Limitazione nota: `conn = "reuse"`
-
-Ogni ripetizione è un **processo curl separato**, quindi la connessione non è
-realmente riusata fra ripetizioni: `conn="new"` aggiunge `--no-keepalive` ed è
-fedele, `conn="reuse"` oggi si comporta come `new`.
-
-Il riuso reale richiederebbe una sola invocazione con l'URL ripetuto `reps`
-volte (curl riusa la connessione fra URL della stessa riga di comando), al
-prezzo di perdere l'avanzamento incrementale — `done` salterebbe da 0 a `reps`
-in un colpo solo. La scelta attuale privilegia il progresso in tempo reale.
+client non supportato) viene registrato nei log e saltato: una configurazione
+sbagliata su un item non deve invalidare l'intera sessione. A differenza di una
+misura fallita (che *è* stata eseguita, solo con esito negativo), qui l'item
+non è mai stato misurato: `item.status` diventa `failed` (non `completed`, per
+non farlo contare come dato valido nelle statistiche) e viene comunque salvato
+un `Result` con `status="failed"`, tempi a zero e `actualProto="unknown"`,
+usando `item.label` e il messaggio d'errore al posto dei campi denormalizzati
+abituali (`target`/`scenarioPath`) che qui non sono disponibili — così il
+fallimento resta tracciato invece di sparire silenziosamente.
 
 ---
 

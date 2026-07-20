@@ -20,7 +20,6 @@ from app.models.session import (
     SessionUpdate,
 )
 from app.models.session_item import (
-    ConnectionMode,
     SessionItem,
     SessionItemBase,
     SessionItemBatchResult,
@@ -55,7 +54,6 @@ __all__ = [
     "ClientCreate",
     "ClientUpdate",
     # session item
-    "ConnectionMode",
     "SessionItem",
     "SessionItemBase",
     "SessionItemBatchResult",

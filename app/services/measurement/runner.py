@@ -107,7 +107,6 @@ async def measure_once(context: MeasurementContext, idx: int) -> ResultCreate:
         url=context.url,
         protocol=context.target.protocol,
         timeout_ms=item.timeout,
-        conn=item.conn,
     )
 
     if not measurement.succeeded:
