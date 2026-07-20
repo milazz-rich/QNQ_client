@@ -221,7 +221,7 @@ Esito di una singola ripetizione.
 | `target`        | `str`                      | snapshot leggibile del target            |
 | `scenarioPath`  | `str`                      | snapshot del path richiesto              |
 | `proto`         | `"HTTP/2" \| "HTTP/3"`     | protocollo richiesto                     |
-| `actualProto`   | `str`                      | protocollo effettivamente negoziato      |
+| `actualProto`   | `"HTTP/2" \| "HTTP/3" \| null` | protocollo negoziato; valorizzato **solo** se `status="completed"`, altrimenti `null` |
 | `total`         | `float`                    | ms, ≥ 0, durata totale                   |
 | `ttfb`          | `float`                    | ms, ≥ 0, time-to-first-byte              |
 | `kb`            | `float`                    | ≥ 0, kilobyte trasferiti                 |
@@ -448,29 +448,42 @@ numeri vengono confrontati con misure esterne che invece riusano la connessione.
 ### 5.3 Fallback di protocollo
 
 `--http2` e `--http3` **non sono vincolanti**: chiedono il protocollo ma
-accettano quello che il server negozia. Verificato empiricamente:
+accettano quello che il server negozia. Il fallback fra HTTP/2 e HTTP/3 (i due
+protocolli che l'applicazione confronta) resta una misura valida; un fallback
+su **HTTP/1.1** (o un `http_version` non determinabile) no, perché non
+rappresenta nessuno dei due protocolli sotto confronto: viene trattato come
+**fallimento della misura**, non come dato valido con protocollo diverso.
+Verificato empiricamente:
 
 | Richiesta   | Server                  | `http_version` | Esito                         |
 | ----------- | ----------------------- | -------------- | ----------------------------- |
 | `--http2`   | `www.google.com`        | `2`            | `completed`, `actualProto` = HTTP/2 |
 | `--http3`   | `www.google.com`        | `3`            | `completed`, `actualProto` = HTTP/3 |
-| `--http2`   | `ftp.gnu.org` (no h2)   | `1.1`          | `completed`, `actualProto` = HTTP/1.1 |
-| `--http3`   | `ftp.gnu.org` (no QUIC) | `1.1`          | `completed`, `actualProto` = HTTP/1.1 |
+| `--http2`   | `ftp.gnu.org` (no h2)   | `1.1`          | `failed`, `actualProto` = `null` |
+| `--http3`   | `ftp.gnu.org` (no QUIC) | `1.1`          | `failed`, `actualProto` = `null` |
 
-Il campo `proto` di `Result` conserva **sempre** il protocollo richiesto;
-l'eventuale fallback finisce in `actualProto`. Un confronto che ignorasse
-`actualProto` misurerebbe HTTP/1.1 credendo di misurare HTTP/3.
+Il campo `proto` di `Result` conserva **sempre** il protocollo richiesto.
+`actualProto` è valorizzato **solo** quando `status="completed"`, e in quel
+caso è sempre HTTP/2 o HTTP/3 — non può contenere HTTP/1.1 né altri valori:
+se il protocollo negoziato non è uno dei due, l'intero `Result` è `failed` e
+`actualProto` resta `null`. Questo evita l'errore opposto rispetto a prima:
+un confronto che leggesse `total`/`ttfb` senza controllare `status` non può
+più scambiare per dati validi una richiesta caduta su HTTP/1.1.
 
 Esiste `--http3-only` per la modalità strict (fallire invece di ripiegare): non
-è usato, perché il requisito è **rilevare** il fallback, non impedirlo.
+è usato, perché il requisito è **rilevare** il fallback fra HTTP/2 e HTTP/3
+(tramite `actualProto`), non impedirlo — mentre un fallback fuori da questi
+due protocolli è comunque un fallimento, rilevato tramite `status="failed"`.
 
 ### 5.4 Fallimenti
 
 Una misura fallita non interrompe mai l'esecuzione: produce un `Result` con
-`status="failed"`, tempi a zero e `actualProto="unknown"`. Sono trattati così:
+`status="failed"`, tempi a zero e `actualProto=null`. Sono trattati così:
 
 * curl esce con codice ≠ 0 (connessione rifiutata, DNS, TLS, `--max-time` scaduto);
 * curl esce con 0 ma `response_code` è 0 (nessuna risposta);
+* curl riceve una risposta ma il protocollo negoziato non è HTTP/2 né HTTP/3
+  (fallback su HTTP/1.1, o `http_version` non riconosciuto) — vedi §5.3;
 * l'output di `-w` non è JSON interpretabile;
 * il binario curl non esiste al path configurato;
 * il processo non termina entro `--max-time` + `CURL_KILL_GRACE_MS`: viene
@@ -482,7 +495,7 @@ sbagliata su un item non deve invalidare l'intera sessione. A differenza di una
 misura fallita (che *è* stata eseguita, solo con esito negativo), qui l'item
 non è mai stato misurato: `item.status` diventa `failed` (non `completed`, per
 non farlo contare come dato valido nelle statistiche) e viene comunque salvato
-un `Result` con `status="failed"`, tempi a zero e `actualProto="unknown"`,
+un `Result` con `status="failed"`, tempi a zero e `actualProto=null`,
 usando `item.label` e il messaggio d'errore al posto dei campi denormalizzati
 abituali (`target`/`scenarioPath`) che qui non sono disponibili — così il
 fallimento resta tracciato invece di sparire silenziosamente.

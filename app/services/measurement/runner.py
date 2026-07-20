@@ -96,11 +96,15 @@ async def measure_once(context: MeasurementContext, idx: int) -> ResultCreate:
     Fa:
         Invoca curl tramite ``curl_client.measure`` e traduce l'esito nel
         modello ``Result``. Un fallimento non solleva eccezioni: produce un
-        risultato con ``status="failed"``, tempi a zero e ``actualProto`` pari a
-        ``"unknown"``, in modo che l'esecuzione della sessione prosegua e il
-        fallimento resti visibile nei dati. Il campo ``proto`` conserva sempre
-        il protocollo *richiesto*; l'eventuale fallback finisce in
-        ``actualProto``.
+        risultato con ``status="failed"``, tempi a zero e ``actualProto=None``,
+        in modo che l'esecuzione della sessione prosegua e il fallimento resti
+        visibile nei dati. Questo include il caso in cui curl riceve una
+        risposta ma il protocollo negoziato non è HTTP/2 né HTTP/3 (es.
+        fallback su HTTP/1.1): non è una misura valida del protocollo
+        richiesto, quindi conta come fallimento anche se la richiesta di rete
+        è andata a buon fine. Il campo ``proto`` conserva sempre il protocollo
+        *richiesto*; ``actualProto`` è valorizzato solo quando ``status`` è
+        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso.
     """
     item = context.session_item
     measurement = await curl_client.measure(

@@ -25,12 +25,14 @@ _WRITE_OUT = (
     '"size_download":%{size_download}}'
 )
 
-# Mappa il valore di %{http_version} di curl sull'etichetta usata nel dominio.
-_HTTP_VERSION_LABELS: dict[str, str] = {
-    "1.0": "HTTP/1.0",
-    "1.1": "HTTP/1.1",
-    "2": "HTTP/2",
-    "3": "HTTP/3",
+# Mappa il valore di %{http_version} di curl sul Protocol di dominio. Solo
+# HTTP/2 e HTTP/3 sono misure valide: HTTP/1.0, HTTP/1.1 e qualunque valore non
+# riconosciuto restano fuori da questa mappa e sono trattati come fallimento
+# (vedi ``_to_measurement``), perché non rappresentano ciò che l'applicazione
+# deve confrontare.
+_VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
+    "2": Protocol.HTTP2,
+    "3": Protocol.HTTP3,
 }
 
 
@@ -39,9 +41,13 @@ class CurlMeasurement:
     """Esito di una singola invocazione di curl.
 
     Attributi:
-        succeeded: ``True`` se curl ha completato la richiesta con successo.
-        actual_proto: protocollo effettivamente negoziato (es. ``"HTTP/2"``);
-            può differire da quello richiesto in caso di fallback.
+        succeeded: ``True`` se curl ha ricevuto una risposta **e** il
+            protocollo negoziato è HTTP/2 o HTTP/3. Un fallback su HTTP/1.1 (o
+            un protocollo non determinabile) conta come fallimento anche se
+            curl è uscito con successo: non è una misura valida del protocollo
+            richiesto.
+        actual_proto: protocollo effettivamente negoziato, solo se
+            ``succeeded`` (sempre e solo HTTP/2 o HTTP/3); ``None`` altrimenti.
         total_ms: durata totale della richiesta in millisecondi.
         ttfb_ms: time-to-first-byte in millisecondi.
         kb: kilobyte scaricati.
@@ -50,7 +56,7 @@ class CurlMeasurement:
     """
 
     succeeded: bool
-    actual_proto: str
+    actual_proto: Protocol | None
     total_ms: float
     ttfb_ms: float
     kb: float
@@ -165,36 +171,60 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeas
 
     Restituisce:
         Un ``CurlMeasurement`` con i tempi in millisecondi e i byte in kilobyte.
+        ``succeeded`` è ``True`` solo se è arrivata una risposta **e** il
+        protocollo negoziato è HTTP/2 o HTTP/3; in tal caso ``actual_proto`` è
+        valorizzato di conseguenza (può comunque differire da ``requested`` in
+        caso di fallback fra i due). Altrimenti ``succeeded=False`` e
+        ``actual_proto=None``: un fallback su HTTP/1.1 non è una misura valida
+        del protocollo richiesto, anche se curl ha ricevuto una risposta.
 
     Fa:
         curl riporta i tempi in secondi e la dimensione in byte: qui vengono
         convertiti nelle unità del modello ``Result`` (ms e KB). Un
         ``response_code`` pari a 0 significa che nessuna risposta è arrivata e
         viene trattato come fallimento anche se il processo è uscito con 0.
-        Un ``http_version`` sconosciuto viene riportato tale e quale invece di
-        essere silenziosamente normalizzato.
+        Tempi e byte sono azzerati anche nel caso di fallback su HTTP/1.1,
+        coerentemente con ogni altro fallimento: non essendo una misura del
+        protocollo richiesto, i numeri non devono poter essere scambiati per
+        dati validi da chi legge solo `total`/`ttfb` senza controllare `status`.
     """
     raw_version = str(payload.get("http_version", ""))
-    actual_proto = _HTTP_VERSION_LABELS.get(raw_version, raw_version or "unknown")
+    negotiated = _VALID_NEGOTIATED_PROTOCOLS.get(raw_version)
     response_code = int(payload.get("response_code", 0) or 0)
+    got_response = response_code > 0
+    succeeded = got_response and negotiated is not None
 
-    measurement = CurlMeasurement(
-        succeeded=response_code > 0,
-        actual_proto=actual_proto,
-        total_ms=float(payload.get("time_total", 0.0) or 0.0) * 1000,
-        ttfb_ms=float(payload.get("time_starttransfer", 0.0) or 0.0) * 1000,
-        kb=float(payload.get("size_download", 0.0) or 0.0) / 1024,
-        response_code=response_code,
-        error=None if response_code > 0 else "Nessuna risposta ricevuta dal server.",
-    )
-
-    if measurement.succeeded and actual_proto != requested.value:
-        logger.info(
-            "Fallback di protocollo: richiesto %s, negoziato %s",
-            requested.value,
-            actual_proto,
+    if not got_response:
+        error = "Nessuna risposta ricevuta dal server."
+    elif negotiated is None:
+        error = (
+            f"Protocollo negoziato non valido: richiesto {requested.value}, "
+            f"ottenuto http_version={raw_version or 'sconosciuto'}."
         )
-    return measurement
+        logger.warning(
+            "Misura scartata, protocollo negoziato non valido (richiesto %s, "
+            "http_version=%s)",
+            requested.value,
+            raw_version or "sconosciuto",
+        )
+    else:
+        error = None
+        if negotiated is not requested:
+            logger.info(
+                "Fallback di protocollo: richiesto %s, negoziato %s",
+                requested.value,
+                negotiated.value,
+            )
+
+    return CurlMeasurement(
+        succeeded=succeeded,
+        actual_proto=negotiated if succeeded else None,
+        total_ms=float(payload.get("time_total", 0.0) or 0.0) * 1000 if succeeded else 0.0,
+        ttfb_ms=float(payload.get("time_starttransfer", 0.0) or 0.0) * 1000 if succeeded else 0.0,
+        kb=float(payload.get("size_download", 0.0) or 0.0) / 1024 if succeeded else 0.0,
+        response_code=response_code,
+        error=error,
+    )
 
 
 def _failed(protocol: Protocol, error: str) -> CurlMeasurement:
@@ -214,7 +244,7 @@ def _failed(protocol: Protocol, error: str) -> CurlMeasurement:
     """
     return CurlMeasurement(
         succeeded=False,
-        actual_proto="unknown",
+        actual_proto=None,
         total_ms=0.0,
         ttfb_ms=0.0,
         kb=0.0,

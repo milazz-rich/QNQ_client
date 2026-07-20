@@ -108,7 +108,7 @@ def _skipped_item_result(item: SessionProgressItem, reason: str) -> ResultCreate
 
     Restituisce:
         Un ``ResultCreate`` con ``status="failed"``, tempi a zero e
-        ``actualProto="unknown"``, coerente con come ``measurement.runner``
+        ``actualProto=None``, coerente con come ``measurement.runner``
         rappresenta un fallimento di misura.
 
     Fa:
@@ -123,7 +123,7 @@ def _skipped_item_result(item: SessionProgressItem, reason: str) -> ResultCreate
         target=item.label,
         scenarioPath=f"(non eseguito: {reason})",
         proto=item.proto,
-        actualProto="unknown",
+        actualProto=None,
         total=0.0,
         ttfb=0.0,
         kb=0.0,
