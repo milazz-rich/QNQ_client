@@ -10,7 +10,15 @@ from app.core.config import settings
 from app.core.cors import setup_cors
 from app.core.errors import register_exception_handlers
 from app.db.mongo import close_mongo_connection, connect_to_mongo
-from app.routers import clients, health, scenarios, session_items, targets
+from app.routers import (
+    clients,
+    health,
+    results,
+    scenarios,
+    session_items,
+    sessions,
+    targets,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +73,8 @@ def create_app() -> FastAPI:
     app.include_router(scenarios.router, prefix=settings.api_prefix)
     app.include_router(clients.router, prefix=settings.api_prefix)
     app.include_router(session_items.router, prefix=settings.api_prefix)
+    app.include_router(sessions.router, prefix=settings.api_prefix)
+    app.include_router(results.router, prefix=settings.api_prefix)
 
     logger.info("Applicazione inizializzata (env=%s).", settings.app_env)
     return app

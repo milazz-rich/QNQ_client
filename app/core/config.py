@@ -1,6 +1,7 @@
 """Configurazione applicativa letta da variabili d'ambiente / file ``.env``."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, computed_field, field_validator
@@ -32,6 +33,9 @@ class Settings(BaseSettings):
     mongo_db: str = Field(default="qnq")
     mongo_uri: str = Field(default="")
     mongo_timeout_ms: int = Field(default=5000, ge=100)
+
+    curl_binary_path: str = Field(default="~/curl/src/curl")
+    curl_kill_grace_ms: int = Field(default=2000, ge=0)
 
     # ``NoDecode`` disattiva il parsing JSON che pydantic-settings applicherebbe
     # ai campi complessi prima dei validator: senza, ``CORS_ORIGINS=http://a``
@@ -78,6 +82,24 @@ class Settings(BaseSettings):
         if self.mongo_uri:
             return self.mongo_uri
         return f"mongodb://{self.mongo_host}:{self.mongo_port}"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def curl_path(self) -> str:
+        """Percorso assoluto del binario curl da invocare.
+
+        Riceve:
+            Nulla (proprietà calcolata).
+
+        Restituisce:
+            Il percorso del binario con la tilde espansa.
+
+        Fa:
+            Espande ``~`` in ``CURL_BINARY_PATH``: ``subprocess`` non passa dalla
+            shell e non la espanderebbe da solo, quindi il default
+            ``~/curl/src/curl`` fallirebbe con "file non trovato".
+        """
+        return str(Path(self.curl_binary_path).expanduser())
 
     @computed_field  # type: ignore[prop-decorator]
     @property

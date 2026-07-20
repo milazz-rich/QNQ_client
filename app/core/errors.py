@@ -66,6 +66,18 @@ class DatabaseError(AppError):
     code = "DATABASE_UNAVAILABLE"
 
 
+class NotImplementedFeatureError(AppError):
+    """Funzionalità prevista dal modello dati ma non ancora realizzata.
+
+    Usata ad esempio quando un ``SessionItem`` referenzia un client diverso da
+    ``curl``: il caso è legittimo nel dominio ma non è implementato, e va
+    distinto da un errore generico perché il frontend possa spiegarlo all'utente.
+    """
+
+    status_code = 501
+    code = "NOT_IMPLEMENTED"
+
+
 def error_body(code: str, message: str, details: Any = None) -> dict[str, Any]:
     """Costruisce il corpo di una risposta di errore.
 
@@ -231,6 +243,7 @@ _CODE_BY_STATUS: dict[int, str] = {
     405: "METHOD_NOT_ALLOWED",
     409: "CONFLICT",
     422: "VALIDATION_ERROR",
+    501: "NOT_IMPLEMENTED",
     503: "SERVICE_UNAVAILABLE",
 }
 

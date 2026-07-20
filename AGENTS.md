@@ -63,12 +63,24 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
     └── services/              # logica di business, zero dipendenze da FastAPI
         ├── __init__.py
         ├── targets_service.py
+        ├── scenarios_service.py
+        ├── clients_service.py
+        ├── session_items_service.py
+        ├── sessions_service.py
+        ├── results_service.py
         ├── measurement/       # esecuzione delle misure HTTP/2 e HTTP/3
         │   ├── __init__.py
-        │   ├── http2.py
-        │   └── http3.py
+        │   ├── curl_client.py # invocazione di curl e parsing dei timing
+        │   └── runner.py      # entità del dominio → misura → Result
         └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
 ```
+
+> **Nota sulla struttura di `measurement/`.** Una prima stesura di questo
+> documento prevedeva `http2.py` e `http3.py` separati. Non è così: nella pratica
+> il protocollo è **un solo flag di curl** (`--http2` / `--http3`), quindi due
+> moduli sarebbero stati identici a meno di una riga. La differenza è confinata
+> in `curl_client._protocol_flag`. La divisione reale è per responsabilità:
+> `curl_client` parla con il processo esterno, `runner` parla con il dominio.
 
 ### Regola di stratificazione
 
@@ -86,10 +98,12 @@ routers/  →  services/  →  db/
 
 Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
-`POST /session-items/batch` per la creazione in blocco del prodotto cartesiano
-Target × Scenario generato dal wizard di sessione).
-Da implementare nei prompt successivi: `sessions`, `results`,
-`services/measurement`, `services/session_runner`.
+`POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
+lettura filtrata di `results`, il measurement service basato su curl e il
+session runner in background.
+
+Non ancora implementato: client diversi da `curl` (Chrome, Firefox), che
+sollevano `NOT_IMPLEMENTED`; interruzione di una sessione già avviata.
 
 ---
 
@@ -313,8 +327,14 @@ Gerarchia in `app/core/errors.py`:
 | `NotFoundError`      | 404  | `NOT_FOUND`           |
 | `ValidationError`    | 422  | `VALIDATION_ERROR`    |
 | `ConflictError`      | 409  | `CONFLICT`            |
+| `NotImplementedFeatureError` | 501 | `NOT_IMPLEMENTED` |
 | `DatabaseError`      | 503  | `DATABASE_UNAVAILABLE`|
 | *(non gestita)*      | 500  | `INTERNAL_ERROR`      |
+
+`NotImplementedFeatureError` è deliberatamente distinta da un errore generico:
+serve a dire "il dominio prevede questo caso, il codice non ancora" — oggi vale
+per i client diversi da `curl`. Il frontend può così spiegare la situazione
+all'utente invece di mostrare un errore opaco.
 
 Gli handler sono registrati in `register_exception_handlers(app)` e coprono
 anche `RequestValidationError` di FastAPI e `HTTPException`, così che **nessuna**
@@ -333,6 +353,14 @@ risposta di errore sfugga al formato comune.
 | `CORS_ORIGINS`   | `http://localhost:4200`        | lista separata da virgole (vedi nota)|
 | `API_PREFIX`     | `/api`                         | prefisso delle rotte                 |
 | `APP_ENV`        | `development`                  | `development` \| `production`        |
+| `CURL_BINARY_PATH` | `~/curl/src/curl`            | binario curl con HTTP/2 **e** HTTP/3 |
+| `CURL_KILL_GRACE_MS` | `2000`                     | margine prima di uccidere il processo|
+
+Il binario di default è una build custom di curl: quello di sistema in genere
+**non** ha HTTP/3. Verificare con `curl --version` che la riga `Features:`
+contenga sia `HTTP2` sia `HTTP3`. La `~` è espansa dall'applicazione
+(`settings.curl_path`): `subprocess` non passa dalla shell e non la
+espanderebbe da sola.
 
 `CORS_ORIGINS` è annotato `NoDecode`: senza, pydantic-settings tenterebbe di
 interpretare il valore come JSON prima dei validator e `CORS_ORIGINS=http://a`
@@ -356,7 +384,96 @@ gestite: è usato dagli health probe.
 
 ---
 
-## 5. Comandi
+## 5. Esecuzione delle misurazioni
+
+### 5.1 Flusso
+
+```
+POST /api/sessions/{id}/start
+  → status = running, risposta 202 immediata
+  → BackgroundTask: session_runner.start_session
+      per ogni item (in SEQUENZA):
+        currentIndex = i, item.status = running, item.total = SessionItem.reps
+        risolve Target / Scenario / Client   (measurement.runner.resolve_context)
+        cancella i Result della run precedente
+        per ogni ripetizione:
+          curl → Result salvato → item.done += 1
+        item.status = completed
+      status = completed
+```
+
+Le misure sono **sequenziali per scelta**: due richieste concorrenti si
+contenderebbero la banda e falserebbero il confronto fra HTTP/2 e HTTP/3, che è
+l'unica cosa che questa applicazione deve misurare.
+
+`done` è incrementato sul database dopo *ogni* ripetizione, con update mirato
+`items.<i>.done` (non riscrittura dell'array): è ciò che permette al polling del
+frontend su `GET /api/sessions/{id}` di mostrare l'avanzamento in tempo reale.
+
+### 5.2 Comando curl
+
+```
+<curl> -s -S -o /dev/null (--http2|--http3) --max-time <timeout> -w <json> [--no-keepalive] <url>
+```
+
+* L'URL è sempre `https://host:port/path`: HTTP/3 richiede TLS per definizione
+  (gira su QUIC) e HTTP/2 lo richiede nella pratica.
+* `-o /dev/null` evita che la scrittura su disco falsi i tempi.
+* `-w` produce una riga JSON con `http_version`, `response_code`, `time_total`,
+  `time_starttransfer`, `size_download`. curl riporta secondi e byte; il modello
+  `Result` usa **millisecondi e kilobyte**, la conversione è in `_to_measurement`.
+* Gli argomenti sono passati come **lista**, mai come stringa di shell: host e
+  path arrivano dal database e non devono poter essere interpretati come comandi.
+
+### 5.3 Fallback di protocollo
+
+`--http2` e `--http3` **non sono vincolanti**: chiedono il protocollo ma
+accettano quello che il server negozia. Verificato empiricamente:
+
+| Richiesta   | Server                  | `http_version` | Esito                         |
+| ----------- | ----------------------- | -------------- | ----------------------------- |
+| `--http2`   | `www.google.com`        | `2`            | `completed`, `actualProto` = HTTP/2 |
+| `--http3`   | `www.google.com`        | `3`            | `completed`, `actualProto` = HTTP/3 |
+| `--http2`   | `ftp.gnu.org` (no h2)   | `1.1`          | `completed`, `actualProto` = HTTP/1.1 |
+| `--http3`   | `ftp.gnu.org` (no QUIC) | `1.1`          | `completed`, `actualProto` = HTTP/1.1 |
+
+Il campo `proto` di `Result` conserva **sempre** il protocollo richiesto;
+l'eventuale fallback finisce in `actualProto`. Un confronto che ignorasse
+`actualProto` misurerebbe HTTP/1.1 credendo di misurare HTTP/3.
+
+Esiste `--http3-only` per la modalità strict (fallire invece di ripiegare): non
+è usato, perché il requisito è **rilevare** il fallback, non impedirlo.
+
+### 5.4 Fallimenti
+
+Una misura fallita non interrompe mai l'esecuzione: produce un `Result` con
+`status="failed"`, tempi a zero e `actualProto="unknown"`. Sono trattati così:
+
+* curl esce con codice ≠ 0 (connessione rifiutata, DNS, TLS, `--max-time` scaduto);
+* curl esce con 0 ma `response_code` è 0 (nessuna risposta);
+* l'output di `-w` non è JSON interpretabile;
+* il binario curl non esiste al path configurato;
+* il processo non termina entro `--max-time` + `CURL_KILL_GRACE_MS`: viene
+  ucciso e atteso, per non lasciare zombie né bloccare la sessione.
+
+Allo stesso modo, un item con configurazione rotta (riferimento inesistente,
+client non supportato) viene registrato nei log, marcato `completed` e saltato:
+una configurazione sbagliata su un item non deve invalidare l'intera sessione.
+
+### 5.5 Limitazione nota: `conn = "reuse"`
+
+Ogni ripetizione è un **processo curl separato**, quindi la connessione non è
+realmente riusata fra ripetizioni: `conn="new"` aggiunge `--no-keepalive` ed è
+fedele, `conn="reuse"` oggi si comporta come `new`.
+
+Il riuso reale richiederebbe una sola invocazione con l'URL ripetuto `reps`
+volte (curl riusa la connessione fra URL della stessa riga di comando), al
+prezzo di perdere l'avanzamento incrementale — `done` salterebbe da 0 a `reps`
+in un colpo solo. La scelta attuale privilegia il progresso in tempo reale.
+
+---
+
+## 6. Comandi
 
 ```bash
 # Setup
@@ -374,7 +491,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ---
 
-## 6. Aggiungere una nuova entità (checklist)
+## 7. Aggiungere una nuova entità (checklist)
 
 1. `app/models/<entita>.py` con `XxxCreate`, `XxxUpdate`, `Xxx`.
 2. Riesportare in `app/models/__init__.py` (barrel).

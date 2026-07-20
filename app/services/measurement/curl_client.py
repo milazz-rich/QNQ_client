@@ -1,0 +1,290 @@
+"""Invocazione del binario curl esterno e parsing dei timing.
+
+Il protocollo (HTTP/2 o HTTP/3) è un semplice flag della riga di comando, quindi
+non esistono due implementazioni separate: c'è un solo esecutore parametrizzato
+sul protocollo. La differenza fra i due casi è confinata in ``_protocol_flag``.
+"""
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+
+from app.core.config import settings
+from app.models.session_item import ConnectionMode
+from app.models.target import Protocol
+
+logger = logging.getLogger(__name__)
+
+# Template del flag -w di curl: produce una riga JSON per ogni richiesta.
+# I valori numerici non sono quotati, quelli testuali sì.
+_WRITE_OUT = (
+    '{"http_version":"%{http_version}",'
+    '"response_code":%{response_code},'
+    '"time_total":%{time_total},'
+    '"time_starttransfer":%{time_starttransfer},'
+    '"size_download":%{size_download}}'
+)
+
+# Mappa il valore di %{http_version} di curl sull'etichetta usata nel dominio.
+_HTTP_VERSION_LABELS: dict[str, str] = {
+    "1.0": "HTTP/1.0",
+    "1.1": "HTTP/1.1",
+    "2": "HTTP/2",
+    "3": "HTTP/3",
+}
+
+
+@dataclass(frozen=True)
+class CurlMeasurement:
+    """Esito di una singola invocazione di curl.
+
+    Attributi:
+        succeeded: ``True`` se curl ha completato la richiesta con successo.
+        actual_proto: protocollo effettivamente negoziato (es. ``"HTTP/2"``);
+            può differire da quello richiesto in caso di fallback.
+        total_ms: durata totale della richiesta in millisecondi.
+        ttfb_ms: time-to-first-byte in millisecondi.
+        kb: kilobyte scaricati.
+        response_code: codice di stato HTTP, ``0`` se la richiesta non è arrivata.
+        error: descrizione del fallimento, ``None`` se andata a buon fine.
+    """
+
+    succeeded: bool
+    actual_proto: str
+    total_ms: float
+    ttfb_ms: float
+    kb: float
+    response_code: int
+    error: str | None = None
+
+
+def build_url(host: str, port: int, path: str) -> str:
+    """Compone l'URL da richiedere.
+
+    Riceve:
+        host: hostname o IP del target, senza schema.
+        port: porta del servizio.
+        path: path dello scenario, già validato come iniziante con ``/``.
+
+    Restituisce:
+        L'URL completo in forma ``https://host:port/path``.
+
+    Fa:
+        Usa sempre ``https``: sia HTTP/2 sia HTTP/3 richiedono TLS nella
+        pratica (HTTP/3 lo richiede per definizione, essendo su QUIC). La porta
+        è sempre esplicita, anche se 443, per non perdere l'informazione
+        configurata sul target.
+    """
+    return f"https://{host}:{port}{path}"
+
+
+def _protocol_flag(protocol: Protocol) -> str:
+    """Restituisce il flag curl che forza il protocollo richiesto.
+
+    Riceve:
+        protocol: il protocollo dichiarato dal target.
+
+    Restituisce:
+        ``"--http3"`` oppure ``"--http2"``.
+
+    Fa:
+        Nota che ``--http3`` non è vincolante: se il server non risponde su
+        QUIC, curl ripiega su HTTP/2 o HTTP/1.1. Il fallback viene rilevato a
+        posteriori confrontando ``%{http_version}`` con il protocollo richiesto.
+    """
+    return "--http3" if protocol is Protocol.HTTP3 else "--http2"
+
+
+def build_command(
+    url: str,
+    protocol: Protocol,
+    timeout_ms: int,
+    conn: ConnectionMode,
+) -> list[str]:
+    """Costruisce la riga di comando di curl per una singola misurazione.
+
+    Riceve:
+        url: l'URL da richiedere.
+        protocol: il protocollo da forzare.
+        timeout_ms: timeout della richiesta in millisecondi.
+        conn: politica di connessione del ``SessionItem``.
+
+    Restituisce:
+        La lista di argomenti da passare a ``asyncio.create_subprocess_exec``.
+
+    Fa:
+        Scarta il corpo della risposta (``-o /dev/null``) per non falsare i
+        tempi con la scrittura su disco, silenzia la progress bar (``-s``) e
+        chiede i timing tramite il template ``-w``. Con ``conn=new`` aggiunge
+        ``--no-keepalive``, che impedisce il riuso della connessione TCP/QUIC.
+        Gli argomenti sono passati come lista, mai come stringa di shell: host e
+        path arrivano dal database e non devono poter essere interpretati come
+        comandi.
+    """
+    command = [
+        settings.curl_path,
+        "-s",
+        "-S",
+        "-o",
+        "/dev/null",
+        _protocol_flag(protocol),
+        "--max-time",
+        f"{timeout_ms / 1000:.3f}",
+        "-w",
+        _WRITE_OUT,
+    ]
+    if conn is ConnectionMode.NEW:
+        command.append("--no-keepalive")
+    command.append(url)
+    return command
+
+
+def _parse_write_out(raw: str) -> dict[str, object]:
+    """Interpreta la riga JSON prodotta dal flag ``-w`` di curl.
+
+    Riceve:
+        raw: lo stdout del processo curl.
+
+    Restituisce:
+        Il dizionario dei timing.
+
+    Fa:
+        Solleva ``ValueError`` se l'output non è JSON valido, cosa che accade
+        quando curl fallisce prima di emettere la riga di ``-w``.
+    """
+    payload = json.loads(raw.strip())
+    if not isinstance(payload, dict):
+        raise ValueError("L'output di curl non è un oggetto JSON.")
+    return payload
+
+
+def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeasurement:
+    """Converte i timing grezzi di curl nel modello di dominio.
+
+    Riceve:
+        payload: il dizionario prodotto da ``_parse_write_out``.
+        requested: il protocollo richiesto, usato per riconoscere il fallback.
+
+    Restituisce:
+        Un ``CurlMeasurement`` con i tempi in millisecondi e i byte in kilobyte.
+
+    Fa:
+        curl riporta i tempi in secondi e la dimensione in byte: qui vengono
+        convertiti nelle unità del modello ``Result`` (ms e KB). Un
+        ``response_code`` pari a 0 significa che nessuna risposta è arrivata e
+        viene trattato come fallimento anche se il processo è uscito con 0.
+        Un ``http_version`` sconosciuto viene riportato tale e quale invece di
+        essere silenziosamente normalizzato.
+    """
+    raw_version = str(payload.get("http_version", ""))
+    actual_proto = _HTTP_VERSION_LABELS.get(raw_version, raw_version or "unknown")
+    response_code = int(payload.get("response_code", 0) or 0)
+
+    measurement = CurlMeasurement(
+        succeeded=response_code > 0,
+        actual_proto=actual_proto,
+        total_ms=float(payload.get("time_total", 0.0) or 0.0) * 1000,
+        ttfb_ms=float(payload.get("time_starttransfer", 0.0) or 0.0) * 1000,
+        kb=float(payload.get("size_download", 0.0) or 0.0) / 1024,
+        response_code=response_code,
+        error=None if response_code > 0 else "Nessuna risposta ricevuta dal server.",
+    )
+
+    if measurement.succeeded and actual_proto != requested.value:
+        logger.info(
+            "Fallback di protocollo: richiesto %s, negoziato %s",
+            requested.value,
+            actual_proto,
+        )
+    return measurement
+
+
+def _failed(protocol: Protocol, error: str) -> CurlMeasurement:
+    """Costruisce l'esito di una misurazione fallita.
+
+    Riceve:
+        protocol: il protocollo richiesto.
+        error: la descrizione del fallimento.
+
+    Restituisce:
+        Un ``CurlMeasurement`` con ``succeeded=False`` e tempi azzerati.
+
+    Fa:
+        Garantisce che ogni tentativo produca comunque un esito strutturato: il
+        session runner deve poter salvare un ``Result`` con ``status="failed"``
+        invece di saltare silenziosamente la ripetizione.
+    """
+    return CurlMeasurement(
+        succeeded=False,
+        actual_proto="unknown",
+        total_ms=0.0,
+        ttfb_ms=0.0,
+        kb=0.0,
+        response_code=0,
+        error=error,
+    )
+
+
+async def measure(
+    url: str,
+    protocol: Protocol,
+    timeout_ms: int,
+    conn: ConnectionMode,
+) -> CurlMeasurement:
+    """Esegue una singola misurazione invocando il binario curl.
+
+    Riceve:
+        url: l'URL da richiedere.
+        protocol: il protocollo da forzare (``--http2`` o ``--http3``).
+        timeout_ms: timeout della richiesta in millisecondi, dal ``SessionItem``.
+        conn: politica di connessione del ``SessionItem``.
+
+    Restituisce:
+        Un ``CurlMeasurement``: mai un'eccezione per un fallimento di rete, così
+        che il chiamante possa registrare il risultato come ``failed``.
+
+    Fa:
+        Lancia curl come sottoprocesso asincrono (``create_subprocess_exec``,
+        senza shell) e ne attende l'esito con un timeout più generoso di quello
+        passato a ``--max-time``: il margine serve a lasciare a curl la
+        possibilità di terminare da solo e riportare l'errore, e a garantire che
+        un processo bloccato venga comunque ucciso invece di fermare l'intera
+        sessione. Se il timeout esterno scatta, il processo viene terminato e
+        atteso, per non lasciare processi zombie.
+    """
+    command = build_command(url, protocol, timeout_ms, conn)
+    process_timeout = (timeout_ms + settings.curl_kill_grace_ms) / 1000
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return _failed(
+            protocol,
+            f"Binario curl non trovato in '{settings.curl_path}'. "
+            "Verificare CURL_BINARY_PATH nel file .env.",
+        )
+    except OSError as exc:
+        return _failed(protocol, f"Impossibile avviare curl: {exc}")
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=process_timeout)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return _failed(protocol, f"curl non ha risposto entro {process_timeout:.1f}s (ucciso).")
+
+    if process.returncode != 0:
+        detail = stderr.decode(errors="replace").strip() or f"exit code {process.returncode}"
+        return _failed(protocol, f"curl ha fallito: {detail}")
+
+    try:
+        payload = _parse_write_out(stdout.decode(errors="replace"))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return _failed(protocol, f"Output di curl non interpretabile: {exc}")
+
+    return _to_measurement(payload, protocol)
