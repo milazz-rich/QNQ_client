@@ -1,0 +1,73 @@
+"""Costruzione dell'applicazione FastAPI: ciclo di vita, CORS, errori, router."""
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.core.config import settings
+from app.core.cors import setup_cors
+from app.core.errors import register_exception_handlers
+from app.db.mongo import close_mongo_connection, connect_to_mongo
+from app.routers import clients, health, scenarios, session_items, targets
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Gestisce il ciclo di vita dell'applicazione.
+
+    Riceve:
+        _: l'istanza FastAPI (non usata).
+
+    Restituisce:
+        Un async context manager che cede il controllo mentre l'app è in esecuzione.
+
+    Fa:
+        All'avvio apre la connessione a MongoDB, allo spegnimento la chiude.
+    """
+    await connect_to_mongo()
+    yield
+    await close_mongo_connection()
+
+
+def create_app() -> FastAPI:
+    """Costruisce e configura l'applicazione FastAPI.
+
+    Riceve:
+        Nulla; legge la configurazione da ``settings``.
+
+    Restituisce:
+        L'istanza ``FastAPI`` pronta per essere servita da uvicorn.
+
+    Fa:
+        Imposta metadati e lifespan, abilita il CORS, registra gli exception
+        handler centralizzati e monta tutti i router sotto ``settings.api_prefix``.
+    """
+    app = FastAPI(
+        title=settings.app_name,
+        description="Backend per il confronto prestazionale HTTP/2 vs HTTP/3.",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    setup_cors(app)
+    register_exception_handlers(app)
+
+    app.include_router(health.router, prefix=settings.api_prefix)
+    app.include_router(targets.router, prefix=settings.api_prefix)
+    app.include_router(scenarios.router, prefix=settings.api_prefix)
+    app.include_router(clients.router, prefix=settings.api_prefix)
+    app.include_router(session_items.router, prefix=settings.api_prefix)
+
+    logger.info("Applicazione inizializzata (env=%s).", settings.app_env)
+    return app
+
+
+app = create_app()
