@@ -10,6 +10,7 @@ from app.db.collections import SESSIONS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
 from app.models.session import RunStatus, Session, SessionCreate, SessionUpdate
+from app.services import results_service
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ async def update_session(session_id: str, payload: SessionUpdate) -> Session:
 
 
 async def delete_session(session_id: str) -> None:
-    """Elimina una sessione.
+    """Elimina una sessione e, a cascata, tutti i suoi ``Result``.
 
     Riceve:
         session_id: identificativo della sessione da eliminare.
@@ -128,19 +129,34 @@ async def delete_session(session_id: str) -> None:
         ``None``.
 
     Fa:
-        Cancella il documento dalla collezione ``sessions`` e solleva
-        ``NotFoundError`` se non esisteva. I ``Result`` prodotti non vengono
-        toccati: sono denormalizzati apposta per sopravvivere alla sessione.
+        Cancella il documento dalla collezione ``sessions`` **e** tutti i
+        ``Result`` con quel ``sessionId``. Il filtro sui risultati usa
+        ``sessionId`` (non ``sessionItemId``): lo stesso ``SessionItem`` può
+        essere condiviso da più sessioni, e cancellare per ``sessionItemId``
+        eliminerebbe anche i risultati di sessioni ancora esistenti.
+
+        MongoDB gira qui in configurazione standalone, che **non** supporta le
+        transazioni multi-documento; l'operazione è quindi resa coerente
+        dall'ordine, non da una transazione. I risultati sono cancellati
+        **prima** della sessione: se la cancellazione della sessione fallisce,
+        la sessione resta e l'operazione è ripetibile; l'ordine inverso
+        lascerebbe invece risultati orfani non più raggiungibili. Nel caso
+        normale di sessione inesistente non ci sono risultati con quel
+        ``sessionId`` da cancellare, quindi la ``delete_many`` è un no-op e la
+        ``NotFoundError`` viene sollevata correttamente sulla sessione.
     """
-    collection = get_collection(SESSIONS)
     object_id = to_object_id(session_id, "Id della sessione")
+
+    deleted_results = await results_service.delete_results_by_session(session_id)
+
+    collection = get_collection(SESSIONS)
     try:
         delete_result = await collection.delete_one({"_id": object_id})
     except PyMongoError as exc:
         raise DatabaseError("Impossibile eliminare la sessione.") from exc
     if delete_result.deleted_count == 0:
         raise NotFoundError(f"Session '{session_id}' non trovata.")
-    logger.info("Session eliminata: %s", session_id)
+    logger.info("Session eliminata: %s (con %d risultati a cascata)", session_id, deleted_results)
 
 
 async def set_status(session_id: str, status: RunStatus) -> None:

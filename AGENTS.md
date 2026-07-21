@@ -216,6 +216,7 @@ Esito di una singola ripetizione.
 | Campo           | Tipo                       | Vincoli                                  |
 | --------------- | -------------------------- | ---------------------------------------- |
 | `id`            | `str`                      | da `_id`                                 |
+| `sessionId`     | `str`                      | riferimento a `sessions`; la sessione che ha prodotto la misura |
 | `sessionItemId` | `str`                      | riferimento a `session_items`            |
 | `idx`           | `int`                      | ≥ 0, indice della ripetizione            |
 | `target`        | `str`                      | snapshot leggibile del target            |
@@ -231,6 +232,17 @@ Esito di una singola ripetizione.
 I campi `target` e `scenarioPath` sono **denormalizzati di proposito**: un
 risultato deve restare leggibile anche se il target o lo scenario vengono
 modificati o eliminati dopo la misura.
+
+**`sessionId` vs `sessionItemId`.** Entrambi sono riferimenti, ma rispondono a
+domande diverse. `sessionItemId` dice *quale configurazione* (target+scenario)
+ha prodotto la misura; `sessionId` dice *quale esecuzione* l'ha prodotta. La
+distinzione è necessaria perché **lo stesso `SessionItem` può essere condiviso
+fra più sessioni**: un rilancio o una riproposizione riusano lo stesso
+`SessionItem`, quindi filtrare o cancellare i risultati per solo `sessionItemId`
+toccherebbe anche misure di altre sessioni ancora esistenti. Solo `sessionId`
+identifica senza ambiguità i risultati di una singola esecuzione — è ciò su cui
+si basano la cancellazione a cascata (§5.5) e il filtro preferito su
+`GET /api/results` (§5.5).
 
 ### 3.4 Pattern dei modelli Pydantic
 
@@ -406,9 +418,9 @@ POST /api/sessions/{id}/start
       per ogni item (in SEQUENZA):
         currentIndex = i, item.status = running, item.total = SessionItem.reps
         risolve Target / Scenario / Client   (measurement.runner.resolve_context)
-        cancella i Result della run precedente
+        cancella i Result di una precedente run DI QUESTA sessione (sessionId+item)
         per ogni ripetizione:
-          curl → Result salvato → item.done += 1
+          curl → Result (con sessionId = questa sessione) salvato → item.done += 1
         item.status = completed
         (se la risoluzione o l'esecuzione falliscono in modo irrecuperabile:
          item.status = failed, viene comunque salvato un Result "failed"
@@ -511,6 +523,35 @@ un `Result` con `status="failed"`, tempi a zero e `actualProto=null`,
 usando `item.label` e il messaggio d'errore al posto dei campi denormalizzati
 abituali (`target`/`scenarioPath`) che qui non sono disponibili — così il
 fallimento resta tracciato invece di sparire silenziosamente.
+
+### 5.5 Cancellazione di una sessione (cascata sui Result)
+
+`DELETE /api/sessions/{id}` cancella la sessione **e**, a cascata, tutti i suoi
+`Result`. Il filtro sui risultati è per `sessionId`, **mai** per `sessionItemId`
+(vedi §3.3): lo stesso `SessionItem` può appartenere a più sessioni, e filtrare
+per `sessionItemId` cancellerebbe misure di sessioni ancora esistenti.
+
+MongoDB gira qui **standalone**, che non supporta le transazioni multi-documento:
+la coerenza è garantita dall'**ordine**, non da una transazione. La cancellazione
+avviene in `sessions_service.delete_session` in due passi:
+
+1. `delete_many` dei `Result` con quel `sessionId`;
+2. `delete_one` della sessione (→ `404 NOT_FOUND` se non esisteva).
+
+I risultati sono cancellati **prima** della sessione di proposito: se il passo 2
+fallisce, la sessione resta e l'operazione è ripetibile; l'ordine inverso
+lascerebbe `Result` orfani non più raggiungibili. Nel caso normale di sessione
+inesistente non esistono risultati con quel `sessionId`, quindi il passo 1 è un
+no-op e il `404` è sollevato correttamente dal passo 2.
+
+> Nota: la pulizia pre-run in `session_runner` (§5.1, "cancella i Result di una
+> precedente run") usa lo stesso principio ma con filtro `sessionId`+`sessionItemId`,
+> per non cancellare i risultati di altre sessioni al rilancio.
+
+Sul versante lettura, `GET /api/results` accetta sia `?sessionId=` (filtro
+**preferito** per i risultati di una singola esecuzione, senza ambiguità) sia
+`?sessionItemIds=` (lista comma-separated, mantenuto per compatibilità); i filtri
+si combinano in AND con `?scenarioPath=`.
 
 ---
 

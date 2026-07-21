@@ -82,12 +82,15 @@ async def resolve_context(session_item: SessionItem) -> MeasurementContext:
     )
 
 
-async def measure_once(context: MeasurementContext, idx: int) -> ResultCreate:
+async def measure_once(context: MeasurementContext, idx: int, session_id: str) -> ResultCreate:
     """Esegue una singola ripetizione e ne costruisce il risultato.
 
     Riceve:
         context: il contesto risolto da ``resolve_context``.
         idx: indice della ripetizione, a partire da 0.
+        session_id: identificativo della sessione che sta eseguendo la misura,
+            salvato in ``Result.sessionId`` per legare il risultato alla singola
+            esecuzione (il ``SessionItem`` può essere condiviso fra sessioni).
 
     Restituisce:
         Un ``ResultCreate`` pronto per essere salvato, con ``status`` pari a
@@ -119,6 +122,7 @@ async def measure_once(context: MeasurementContext, idx: int) -> ResultCreate:
         )
 
     return ResultCreate(
+        sessionId=session_id,
         sessionItemId=item.id,
         idx=idx,
         target=context.target_label,

@@ -24,6 +24,15 @@ class ResultBase(MongoModel):
     eliminati dopo la misura.
     """
 
+    session_id: MongoId = Field(
+        alias="sessionId",
+        description=(
+            "Session che ha effettivamente prodotto la misura. Distinto da "
+            "sessionItemId: lo stesso SessionItem può essere condiviso da più "
+            "sessioni (rilancio/riproposizione), quindi solo sessionId "
+            "identifica senza ambiguità i risultati di una singola esecuzione."
+        ),
+    )
     session_item_id: MongoId = Field(
         alias="sessionItemId", description="SessionItem che ha prodotto il risultato"
     )

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 async def list_results(
     scenario_path: str | None = None,
     session_item_ids: list[str] | None = None,
+    session_id: str | None = None,
 ) -> list[Result]:
     """Elenca i risultati, opzionalmente filtrati.
 
@@ -27,7 +28,12 @@ async def list_results(
         scenario_path: se valorizzato, restituisce solo i risultati di quello
             scenario (confronto esatto sul path richiesto).
         session_item_ids: se valorizzata, restituisce solo i risultati prodotti
-            da quei session item; usata dal frontend per il filtro per sessione.
+            da quei session item.
+        session_id: se valorizzato, restituisce solo i risultati prodotti da
+            quella singola esecuzione di sessione. È il filtro **preferito** per
+            "i risultati di questa sessione": diretto e senza l'ambiguità di
+            ``session_item_ids``, dato che uno stesso ``SessionItem`` può essere
+            condiviso fra più sessioni.
 
     Restituisce:
         La lista dei ``Result`` che soddisfano i filtri, ordinata per istante di
@@ -44,6 +50,8 @@ async def list_results(
         query["scenarioPath"] = scenario_path
     if session_item_ids:
         query["sessionItemId"] = {"$in": session_item_ids}
+    if session_id:
+        query["sessionId"] = session_id
 
     collection = get_collection(RESULTS)
     try:
@@ -101,27 +109,59 @@ async def create_result(payload: ResultCreate) -> Result:
     return Result.model_validate({**document, "_id": insert_result.inserted_id})
 
 
-async def delete_results_by_session_items(session_item_ids: list[str]) -> int:
-    """Elimina tutti i risultati prodotti dai session item indicati.
+async def delete_results_by_session(session_id: str) -> int:
+    """Elimina tutti i risultati prodotti da una singola esecuzione di sessione.
 
     Riceve:
-        session_item_ids: gli identificativi dei session item.
+        session_id: identificativo della sessione i cui risultati vanno eliminati.
 
     Restituisce:
         Il numero di risultati eliminati.
 
     Fa:
-        Usata per ripulire i risultati di una esecuzione precedente quando una
-        sessione viene riavviata, così che i dati di due run non si mescolino.
-        Con lista vuota non tocca il database e restituisce 0.
+        Filtra per ``sessionId``, non per ``sessionItemId``: così la
+        cancellazione a cascata di una sessione (vedi
+        ``sessions_service.delete_session``) non tocca i risultati di altre
+        sessioni che condividono lo stesso ``SessionItem``. Il confronto è per
+        stringa, coerente con come il runner salva l'id.
     """
-    if not session_item_ids:
-        return 0
-
     collection = get_collection(RESULTS)
     try:
-        delete_result = await collection.delete_many({"sessionItemId": {"$in": session_item_ids}})
+        delete_result = await collection.delete_many({"sessionId": session_id})
+    except PyMongoError as exc:
+        raise DatabaseError("Impossibile eliminare i risultati della sessione.") from exc
+    logger.info("Risultati eliminati per la sessione %s: %d", session_id, delete_result.deleted_count)
+    return delete_result.deleted_count
+
+
+async def delete_results_by_session_and_item(session_id: str, session_item_id: str) -> int:
+    """Elimina i risultati di un item nell'ambito di una singola sessione.
+
+    Riceve:
+        session_id: identificativo della sessione in esecuzione.
+        session_item_id: identificativo del session item.
+
+    Restituisce:
+        Il numero di risultati eliminati.
+
+    Fa:
+        Usata per ripulire i risultati di una **precedente esecuzione di questa
+        stessa sessione** prima di rieseguire un item, così che un rilancio non
+        accumuli duplicati. Il filtro combina ``sessionId`` e ``sessionItemId``
+        in AND: senza ``sessionId`` cancellerebbe anche i risultati di altre
+        sessioni che riusano lo stesso ``SessionItem``.
+    """
+    collection = get_collection(RESULTS)
+    try:
+        delete_result = await collection.delete_many(
+            {"sessionId": session_id, "sessionItemId": session_item_id}
+        )
     except PyMongoError as exc:
         raise DatabaseError("Impossibile eliminare i risultati precedenti.") from exc
-    logger.info("Risultati eliminati: %d", delete_result.deleted_count)
+    logger.info(
+        "Risultati eliminati per la sessione %s / item %s: %d",
+        session_id,
+        session_item_id,
+        delete_result.deleted_count,
+    )
     return delete_result.deleted_count

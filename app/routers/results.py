@@ -34,13 +34,26 @@ async def list_results(
         alias="sessionItemIds",
         description="Filtra per session item: lista di id separati da virgola",
     ),
+    session_id: str | None = Query(
+        default=None,
+        alias="sessionId",
+        description=(
+            "Filtra per singola esecuzione di sessione. Preferito a "
+            "sessionItemIds per ottenere i risultati di UNA sessione: diretto e "
+            "senza ambiguità quando un SessionItem è condiviso fra più sessioni"
+        ),
+    ),
 ) -> list[Result]:
     """Restituisce i risultati, opzionalmente filtrati.
 
     Riceve:
         scenario_path: valore di ``?scenarioPath=``, filtra per singolo scenario.
         session_item_ids: valore di ``?sessionItemIds=``, lista di id separati
-            da virgola; è la forma usata dal frontend per il filtro per sessione.
+            da virgola.
+        session_id: valore di ``?sessionId=``, filtra per la singola esecuzione
+            di sessione. È il filtro preferito per "i risultati di questa
+            sessione": ``sessionItemIds`` resta disponibile ma è ambiguo quando
+            uno stesso ``SessionItem`` è condiviso fra più sessioni.
 
     Restituisce:
         ``200`` con la lista dei risultati che soddisfano i filtri, ordinata per
@@ -53,7 +66,7 @@ async def list_results(
     """
     ids = _split_ids(session_item_ids)
     return await results_service.list_results(
-        scenario_path=scenario_path, session_item_ids=ids
+        scenario_path=scenario_path, session_item_ids=ids, session_id=session_id
     )
 
 

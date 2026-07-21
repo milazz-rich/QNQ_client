@@ -90,19 +90,27 @@ async def _run_items(session: Session) -> None:
                 exc.message,
             )
             final_status = RunStatus.FAILED
-            await results_service.create_result(_skipped_item_result(item, exc.message))
+            await results_service.create_result(
+                _skipped_item_result(session.id, item, exc.message)
+            )
         except Exception as exc:
             logger.exception("Item %d della sessione %s interrotto", index, session.id)
             final_status = RunStatus.FAILED
-            await results_service.create_result(_skipped_item_result(item, str(exc)))
+            await results_service.create_result(
+                _skipped_item_result(session.id, item, str(exc))
+            )
         finally:
             await sessions_service.update_item_progress(session.id, index, status=final_status)
 
 
-def _skipped_item_result(item: SessionProgressItem, reason: str) -> ResultCreate:
+def _skipped_item_result(
+    session_id: str, item: SessionProgressItem, reason: str
+) -> ResultCreate:
     """Costruisce il ``Result`` segnaposto per un item mai misurato.
 
     Riceve:
+        session_id: identificativo della sessione in esecuzione, salvato in
+            ``Result.sessionId``.
         item: l'item di avanzamento saltato, prima di qualunque ripetizione.
         reason: messaggio dell'errore che ha impedito la misura.
 
@@ -118,6 +126,7 @@ def _skipped_item_result(item: SessionProgressItem, reason: str) -> ResultCreate
         denormalizzati abituali.
     """
     return ResultCreate(
+        sessionId=session_id,
         sessionItemId=item.session_item_id,
         idx=item.done,
         target=item.label,
@@ -146,7 +155,10 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
     Fa:
         Carica il ``SessionItem`` di configurazione, risolve target, scenario e
         client (``NotImplementedFeatureError`` se il client non è curl), elimina
-        gli eventuali risultati di una esecuzione precedente e poi esegue
+        gli eventuali risultati di una **precedente esecuzione di questa stessa
+        sessione** per questo item — scoping per ``(sessionId, sessionItemId)``,
+        non per solo ``sessionItemId``: il ``SessionItem`` può essere condiviso
+        da altre sessioni, i cui risultati non vanno toccati — e poi esegue
         ``reps`` misurazioni. Dopo ogni ripetizione salva il ``Result`` e
         incrementa ``done`` sul database, così che il polling del frontend veda
         l'avanzamento progredire. Il campo ``total`` è riallineato a ``reps``
@@ -156,7 +168,7 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
     session_item = await session_items_service.get_session_item(item.session_item_id)
     context = await measurement_runner.resolve_context(session_item)
 
-    await results_service.delete_results_by_session_items([session_item.id])
+    await results_service.delete_results_by_session_and_item(session_id, session_item.id)
     await sessions_service.update_item_progress(
         session_id, index, total=session_item.reps, done=0
     )
@@ -170,6 +182,6 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
     )
 
     for idx in range(session_item.reps):
-        result = await measurement_runner.measure_once(context, idx)
+        result = await measurement_runner.measure_once(context, idx, session_id)
         await results_service.create_result(result)
         await sessions_service.update_item_progress(session_id, index, done=idx + 1)
