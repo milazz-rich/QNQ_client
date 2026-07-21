@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     curl_binary_path: str = Field(default="~/curl/src/curl")
     curl_kill_grace_ms: int = Field(default=2000, ge=0)
+    curl_ca_bundle_path: str = Field(default="")
 
     # ``NoDecode`` disattiva il parsing JSON che pydantic-settings applicherebbe
     # ai campi complessi prima dei validator: senza, ``CORS_ORIGINS=http://a``
@@ -100,6 +101,28 @@ class Settings(BaseSettings):
             ``~/curl/src/curl`` fallirebbe con "file non trovato".
         """
         return str(Path(self.curl_binary_path).expanduser())
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def curl_ca_bundle(self) -> str:
+        """Percorso assoluto del certificato CA custom per curl, se configurato.
+
+        Riceve:
+            Nulla (proprietà calcolata).
+
+        Restituisce:
+            Il percorso con la tilde espansa, oppure stringa vuota se
+            ``CURL_CA_BUNDLE_PATH`` non è valorizzata.
+
+        Fa:
+            Stessa espansione di ``curl_path``: ``subprocess`` non passa dalla
+            shell e non espanderebbe ``~`` da solo. Una stringa vuota resta
+            vuota (nessun bundle configurato), non viene espansa in "home
+            dell'utente".
+        """
+        if not self.curl_ca_bundle_path:
+            return ""
+        return str(Path(self.curl_ca_bundle_path).expanduser())
 
     @computed_field  # type: ignore[prop-decorator]
     @property

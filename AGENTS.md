@@ -354,12 +354,24 @@ risposta di errore sfugga al formato comune.
 | `APP_ENV`        | `development`                  | `development` \| `production`        |
 | `CURL_BINARY_PATH` | `~/curl/src/curl`            | binario curl con HTTP/2 **e** HTTP/3 |
 | `CURL_KILL_GRACE_MS` | `2000`                     | margine prima di uccidere il processo|
+| `CURL_CA_BUNDLE_PATH` | *(vuoto)*                | opzionale, certificato CA custom (`--cacert`) |
 
 Il binario di default è una build custom di curl: quello di sistema in genere
 **non** ha HTTP/3. Verificare con `curl --version` che la riga `Features:`
 contenga sia `HTTP2` sia `HTTP3`. La `~` è espansa dall'applicazione
 (`settings.curl_path`): `subprocess` non passa dalla shell e non la
 espanderebbe da sola.
+
+`CURL_CA_BUNDLE_PATH` serve per i target con certificato **self-signed** o
+emesso da una CA privata (es. un server di test come `milaz.it`): senza,
+curl rifiuta la connessione con `SSL certificate problem: self-signed
+certificate` e la misura fallisce prima ancora di partire. Se valorizzata,
+`curl_client.build_command` aggiunge `--cacert <path>` (tilde espansa allo
+stesso modo di `CURL_BINARY_PATH`, tramite `settings.curl_ca_bundle`).
+Deliberatamente **non** si usa `-k`/`--insecure`: quello disabiliterebbe la
+verifica TLS per qualunque target, nascondendo anche problemi reali (es. un
+certificato scaduto su un target di produzione); `--cacert` estende invece
+l'insieme di CA fidate con una aggiuntiva, mantenendo la verifica attiva.
 
 `CORS_ORIGINS` è annotato `NoDecode`: senza, pydantic-settings tenterebbe di
 interpretare il valore come JSON prima dei validator e `CORS_ORIGINS=http://a`

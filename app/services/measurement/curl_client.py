@@ -123,11 +123,16 @@ def build_command(
         ``--no-keepalive``: ogni ripetizione è comunque un processo curl
         separato (nessuna connessione sopravvive fra un processo e l'altro), il
         flag rende esplicito che ogni misura è sempre "a freddo", invece di
-        lasciare intendere un riuso che non può avvenire. Gli argomenti sono
-        passati come lista, mai come stringa di shell: host e path arrivano dal
-        database e non devono poter essere interpretati come comandi.
+        lasciare intendere un riuso che non può avvenire. Se
+        ``CURL_CA_BUNDLE_PATH`` è configurata, aggiunge ``--cacert <path>``:
+        serve a validare certificati self-signed o emessi da una CA privata
+        (es. il target di test `milaz.it`) senza disabilitare la verifica TLS
+        (`-k`), che varrebbe per qualunque target e nasconderebbe anche
+        problemi reali. Gli argomenti sono passati come lista, mai come
+        stringa di shell: host e path arrivano dal database e non devono poter
+        essere interpretati come comandi.
     """
-    return [
+    command = [
         settings.curl_path,
         "-s",
         "-S",
@@ -139,8 +144,11 @@ def build_command(
         "-w",
         _WRITE_OUT,
         "--no-keepalive",
-        url,
     ]
+    if settings.curl_ca_bundle:
+        command.extend(["--cacert", settings.curl_ca_bundle])
+    command.append(url)
+    return command
 
 
 def _parse_write_out(raw: str) -> dict[str, object]:
