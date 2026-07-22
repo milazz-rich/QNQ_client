@@ -147,9 +147,8 @@ Server sotto test.
 | `host`     | `str`                    | 1–255 char, hostname o IP, senza schema `://` |
 | `port`     | `int`                    | 1–65535                                       |
 | `protocol` | `"HTTP/2" \| "HTTP/3"`   | enum                                          |
-| `maxc`     | `int`                    | ≥ 1, concorrenza massima supportata           |
 | `status`   | `"online"\|"idle"\|"offline"` | enum, default `offline`                  |
-| `latency`  | `float`                  | ≥ 0, millisecondi, default `0`                |
+| `tag`      | `str`                    | etichetta breve, ≤ 40 char, default `""`      |
 
 #### Scenario — collezione `scenarios`
 

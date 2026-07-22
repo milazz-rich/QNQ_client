@@ -34,11 +34,10 @@ class TargetBase(MongoModel):
     )
     port: int = Field(ge=1, le=65535, description="Porta TCP/UDP del servizio")
     protocol: Protocol = Field(description="Protocollo esposto dal target")
-    maxc: int = Field(ge=1, description="Numero massimo di connessioni concorrenti")
     status: TargetStatus = Field(
         default=TargetStatus.OFFLINE, description="Stato di disponibilità"
     )
-    latency: float = Field(default=0.0, ge=0, description="Latenza rilevata in millisecondi")
+    tag: str = Field(default="", max_length=40, description="Etichetta breve di categoria")
 
 
 class TargetCreate(TargetBase):
@@ -54,9 +53,8 @@ class TargetUpdate(MongoModel):
     )
     port: int | None = Field(default=None, ge=1, le=65535)
     protocol: Protocol | None = None
-    maxc: int | None = Field(default=None, ge=1)
     status: TargetStatus | None = None
-    latency: float | None = Field(default=None, ge=0)
+    tag: str | None = Field(default=None, max_length=40)
 
 
 class Target(TargetBase, MongoDocument):
