@@ -107,7 +107,8 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         richiesto, quindi conta come fallimento anche se la richiesta di rete
         è andata a buon fine. Il campo ``proto`` conserva sempre il protocollo
         *richiesto*; ``actualProto`` è valorizzato solo quando ``status`` è
-        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso.
+        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso. ``targetId``
+        è preso da ``context.target.id``, già risolto da ``resolve_context``.
     """
     item = context.session_item
     measurement = await curl_client.measure(
@@ -124,6 +125,7 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
     return ResultCreate(
         sessionId=session_id,
         sessionItemId=item.id,
+        targetId=context.target.id,
         idx=idx,
         target=context.target_label,
         scenarioPath=context.scenario.path,

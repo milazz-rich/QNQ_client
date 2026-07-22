@@ -12,9 +12,11 @@ from app.models.target import Protocol
 class RunStatus(StrEnum):
     """Stato di avanzamento di una sessione o di un suo item.
 
-    ``FAILED`` si applica solo a ``SessionProgressItem.status``: una sessione
-    nel suo complesso arriva sempre a ``COMPLETED`` (§5.1 di AGENTS.md), è il
-    singolo item a poter risultare mai misurato.
+    Su ``SessionProgressItem.status``, ``FAILED`` indica un item mai misurato
+    (configurazione rotta, client non supportato). Su ``Session.status``,
+    ``FAILED`` è lo stato finale se **almeno un item** della sessione è
+    terminato ``failed``; ``COMPLETED`` solo se lo sono stati tutti (§5.1 di
+    AGENTS.md).
     """
 
     PENDING = "pending"

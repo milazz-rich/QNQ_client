@@ -36,6 +36,15 @@ class ResultBase(MongoModel):
     session_item_id: MongoId = Field(
         alias="sessionItemId", description="SessionItem che ha prodotto il risultato"
     )
+    target_id: MongoId = Field(
+        alias="targetId",
+        description=(
+            "Target su cui è stata eseguita la misura. Riferimento diretto, "
+            "distinto dallo snapshot leggibile in 'target': permette di "
+            "raggruppare/filtrare i risultati per target anche se il campo "
+            "'target' (denormalizzato) resta invariato dopo una rinomina."
+        ),
+    )
     idx: int = Field(ge=0, description="Indice della ripetizione, a partire da 0")
     target: str = Field(min_length=1, max_length=300, description="Snapshot leggibile del target")
     scenario_path: str = Field(

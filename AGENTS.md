@@ -193,7 +193,7 @@ Esecuzione di un insieme ordinato di `SessionItem`.
 | `id`           | `str`                                    | da `_id`                            |
 | `name`         | `str`                                    | 1–120 char                          |
 | `when`         | `datetime`                               | UTC, ISO-8601                       |
-| `status`       | `"pending"\|"running"\|"completed"`      | default `pending`                   |
+| `status`       | `"pending"\|"running"\|"completed"\|"failed"` | default `pending`; `failed` se almeno un item termina `failed` |
 | `currentIndex` | `int`                                    | ≥ 0, indice dell'item in esecuzione |
 | `items`        | `SessionProgressItem[]`                  | embedded, vedi sotto                |
 
@@ -217,6 +217,7 @@ Esito di una singola ripetizione.
 | `id`            | `str`                      | da `_id`                                 |
 | `sessionId`     | `str`                      | riferimento a `sessions`; la sessione che ha prodotto la misura |
 | `sessionItemId` | `str`                      | riferimento a `session_items`            |
+| `targetId`      | `str`                      | riferimento a `targets`; il target su cui è stata eseguita la misura |
 | `idx`           | `int`                      | ≥ 0, indice della ripetizione            |
 | `target`        | `str`                      | snapshot leggibile del target            |
 | `scenarioPath`  | `str`                      | snapshot del path richiesto              |
@@ -242,6 +243,16 @@ toccherebbe anche misure di altre sessioni ancora esistenti. Solo `sessionId`
 identifica senza ambiguità i risultati di una singola esecuzione — è ciò su cui
 si basano la cancellazione a cascata (§5.5) e il filtro preferito su
 `GET /api/results` (§5.5).
+
+**`targetId` vs `target`.** Stessa distinzione fra riferimento e snapshot già
+vista per `sessionItemId`/`target` (denormalizzazione, sopra): `targetId` è il
+riferimento diretto a `targets._id`, usato per raggruppare o filtrare i
+risultati per target; `target` resta lo snapshot leggibile (`"nome (host:porta)"`),
+denormalizzato apposta per restare comprensibile anche se il target viene
+rinominato o cancellato. `targetId` è popolato da `measurement.runner` (per le
+misure reali, dal `Target` già risolto) e da `session_runner` (per i `Result`
+segnaposto degli item saltati, recuperandolo dal `SessionItem` di
+configurazione) — mai dal client HTTP.
 
 ### 3.4 Pattern dei modelli Pydantic
 
@@ -420,16 +431,29 @@ POST /api/sessions/{id}/start
         cancella i Result di una precedente run DI QUESTA sessione (sessionId+item)
         per ogni ripetizione:
           curl → Result (con sessionId = questa sessione) salvato → item.done += 1
-        item.status = completed
-        (se la risoluzione o l'esecuzione falliscono in modo irrecuperabile:
-         item.status = failed, viene comunque salvato un Result "failed"
-         segnaposto — vedi §5.4)
-      status = completed
+        item.status = completed SE tutte le ripetizioni hanno prodotto Result "completed"
+        item.status = failed    SE almeno una ripetizione ha prodotto Result "failed"
+        (se la risoluzione fallisce in modo irrecuperabile PRIMA di eseguire
+         qualunque ripetizione: item.status = failed, viene comunque salvato
+         un Result "failed" segnaposto — vedi §5.4)
+      status = completed SE tutti gli item sono completed
+      status = failed    SE almeno un item è failed
 ```
 
 Le misure sono **sequenziali per scelta**: due richieste concorrenti si
 contenderebbero la banda e falserebbero il confronto fra HTTP/2 e HTTP/3, che è
 l'unica cosa che questa applicazione deve misurare.
+
+Lo stato finale della sessione riflette l'esito reale dell'esecuzione, non solo
+il fatto che sia arrivata in fondo: `session_runner._run_items` tiene traccia di
+se **almeno un item** è terminato `failed` e restituisce l'esito complessivo a
+`start_session`, che imposta `status="completed"` solo se **tutti** gli item
+sono `completed`, altrimenti `status="failed"`. Una sessione `failed` ha
+comunque eseguito (e tracciato) tutti i suoi item — nessuno viene saltato per
+via del fallimento di un altro — semplicemente il suo esito complessivo non è
+positivo. Anche un'eccezione imprevista *prima* che gli item vengano eseguiti
+(bug, non un fallimento di dominio) porta la sessione a `failed`, mai a
+`completed`: non c'è garanzia che l'esecuzione sia avvenuta correttamente.
 
 `done` è incrementato sul database dopo *ogni* ripetizione, con update mirato
 `items.<i>.done` (non riscrittura dell'array): è ciò che permette al polling del
@@ -512,16 +536,42 @@ Una misura fallita non interrompe mai l'esecuzione: produce un `Result` con
 * il processo non termina entro `--max-time` + `CURL_KILL_GRACE_MS`: viene
   ucciso e atteso, per non lasciare zombie né bloccare la sessione.
 
+**L'esito delle ripetizioni si propaga allo stato dell'item.** `done == total`
+non basta più a rendere un item `completed`: se **almeno una** delle sue
+ripetizioni ha prodotto un `Result` con `status="failed"` (per una qualunque
+delle ragioni sopra), l'intero item termina `status="failed"`, anche se ha
+eseguito regolarmente tutte le `reps` previste. Solo se **tutte** le
+ripetizioni sono `completed` l'item risulta `completed`. La ragione è la
+stessa che vale per la sessione (sotto): un item il cui unico esito è "ho
+tentato" senza aver prodotto nemmeno una misura valida non deve poter essere
+scambiato per un dato affidabile solo perché `done` ha raggiunto `total`. Un
+mix di ripetizioni riuscite e fallite nello stesso item conta comunque come
+`failed` — basta *una sola* ripetizione fallita.
+
 Allo stesso modo, un item con configurazione rotta (riferimento inesistente,
-client non supportato) viene registrato nei log e saltato: una configurazione
-sbagliata su un item non deve invalidare l'intera sessione. A differenza di una
-misura fallita (che *è* stata eseguita, solo con esito negativo), qui l'item
-non è mai stato misurato: `item.status` diventa `failed` (non `completed`, per
-non farlo contare come dato valido nelle statistiche) e viene comunque salvato
-un `Result` con `status="failed"`, tempi a zero e `actualProto=null`,
-usando `item.label` e il messaggio d'errore al posto dei campi denormalizzati
-abituali (`target`/`scenarioPath`) che qui non sono disponibili — così il
-fallimento resta tracciato invece di sparire silenziosamente.
+client non supportato) viene registrato nei log e saltato **prima di eseguire
+qualunque ripetizione**: una configurazione sbagliata su un item non deve
+invalidare l'intera sessione. A differenza delle ripetizioni fallite sopra
+(che *sono* state eseguite, solo con esito negativo), qui l'item non è mai
+stato misurato: `item.status` diventa `failed` allo stesso modo (non
+`completed`, per non farlo contare come dato valido nelle statistiche) e
+viene comunque salvato un `Result` con `status="failed"`, tempi a zero e
+`actualProto=null`, usando `item.label` e il messaggio d'errore al posto dei
+campi denormalizzati abituali (`target`/`scenarioPath`) che qui non sono
+disponibili — così il fallimento resta tracciato invece di sparire
+silenziosamente. `targetId` (obbligatorio in `Result`) viene recuperato da
+`session_runner` rileggendo il `SessionItem` di configurazione. **Unico caso
+limite**: se anche il `SessionItem` referenziato non esiste più (cancellato
+dopo essere stato incluso in questa sessione), non c'è alcun `targetId` da cui
+costruire un `Result` valido; in quel caso specifico l'item viene comunque
+marcato `failed` e l'errore resta nei log applicativi, ma **nessun `Result`**
+viene creato per quell'item.
+
+In sintesi, un item termina `failed` in due casi distinti — mai eseguito
+(configurazione rotta) oppure eseguito ma senza successo (una o più
+ripetizioni fallite) — e in entrambi si applica la stessa regola di
+propagazione verso la sessione: **un solo item `failed` porta l'intera
+sessione a `failed`** (§5.1).
 
 ### 5.5 Cancellazione di una sessione (cascata sui Result)
 

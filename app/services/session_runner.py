@@ -33,46 +33,67 @@ async def start_session(session_id: str) -> None:
     Fa:
         Porta la sessione in ``running``, esegue in sequenza ogni item
         aggiornandone l'avanzamento sul database man mano, e al termine la porta
-        in ``completed``. Non solleva mai eccezioni verso il chiamante: gira
-        come background task, dove un'eccezione non gestita finirebbe solo nei
-        log lasciando la sessione bloccata in ``running`` per sempre. Ogni
-        errore viene registrato e la sessione viene comunque chiusa.
+        in ``completed`` se tutti gli item sono riusciti, in ``failed`` se
+        almeno uno è terminato con ``status="failed"`` (configurazione rotta,
+        client non supportato, errore imprevisto). Non solleva mai eccezioni
+        verso il chiamante: gira come background task, dove un'eccezione non
+        gestita finirebbe solo nei log lasciando la sessione bloccata in
+        ``running`` per sempre. Ogni errore viene registrato e la sessione
+        viene comunque chiusa; un'eccezione inattesa **prima** che
+        ``_run_items`` possa riportare l'esito reale è trattata come
+        ``failed``, non ``completed``, perché non c'è garanzia che gli item
+        siano stati eseguiti correttamente.
     """
     logger.info("Avvio esecuzione sessione %s", session_id)
+    all_items_succeeded = False
     try:
         session = await sessions_service.get_session(session_id)
         await sessions_service.set_status(session_id, RunStatus.RUNNING)
-        await _run_items(session)
+        all_items_succeeded = await _run_items(session)
     except Exception:
         logger.exception("Esecuzione della sessione %s interrotta da un errore", session_id)
     finally:
+        final_status = RunStatus.COMPLETED if all_items_succeeded else RunStatus.FAILED
         try:
-            await sessions_service.set_status(session_id, RunStatus.COMPLETED)
-            logger.info("Sessione %s completata", session_id)
+            await sessions_service.set_status(session_id, final_status)
+            logger.info("Sessione %s conclusa con stato %s", session_id, final_status.value)
         except AppError:
-            logger.exception("Impossibile marcare come completata la sessione %s", session_id)
+            logger.exception("Impossibile impostare lo stato finale della sessione %s", session_id)
 
 
-async def _run_items(session: Session) -> None:
+async def _run_items(session: Session) -> bool:
     """Esegue in sequenza tutti gli item di avanzamento di una sessione.
 
     Riceve:
         session: la sessione già caricata, con la lista ``items`` da eseguire.
 
     Restituisce:
-        ``None``.
+        ``True`` se tutti gli item sono terminati con ``status="completed"``,
+        ``False`` se almeno uno è terminato con ``status="failed"``. Usato da
+        ``start_session`` per decidere lo stato finale della sessione.
 
     Fa:
         Per ogni item aggiorna ``currentIndex``, lo porta in ``running``, esegue
-        le ripetizioni e lo chiude in ``completed``. Un item che fallisce in
-        modo irrecuperabile (riferimento rotto, client non supportato) non è mai
-        stato misurato: viene marcato ``failed`` (non ``completed``, per non
-        farlo contare come dato valido), viene comunque salvato un ``Result``
-        con ``status="failed"`` così il fallimento resta tracciato invece di
-        sparire silenziosamente, e l'esecuzione prosegue con il successivo —
-        una configurazione sbagliata su un item non deve invalidare l'intera
-        sessione.
+        le ripetizioni e lo chiude in ``completed`` **solo se sono riuscite
+        tutte**. Due modi distinti in cui un item può risultare ``failed``:
+
+        1. *Mai eseguito* — configurazione rotta o client non supportato:
+           ``_run_single_item`` solleva un'eccezione prima di qualunque
+           ripetizione. Viene comunque salvato un ``Result`` segnaposto con
+           ``status="failed"`` così il fallimento resta tracciato invece di
+           sparire silenziosamente (vedi ``_save_skipped_item_result``).
+        2. *Eseguito ma senza successo* — ``_run_single_item`` porta a termine
+           tutte le ripetizioni (``done`` raggiunge ``total``), ma almeno una
+           ha prodotto un ``Result`` con ``status="failed"``: l'item non ha
+           prodotto una misura valida e non deve risultare ``completed`` solo
+           perché ha *tentato* tutte le ripetizioni.
+
+        In entrambi i casi l'esecuzione prosegue con l'item successivo — una
+        configurazione sbagliata o una misura fallita su un item non deve
+        invalidare l'intera sessione (che comunque, nel suo complesso,
+        risulterà ``failed`` se anche un solo item lo è).
     """
+    any_item_failed = False
     for index, item in enumerate(session.items):
         await sessions_service.set_current_index(session.id, index)
         await sessions_service.update_item_progress(
@@ -80,7 +101,10 @@ async def _run_items(session: Session) -> None:
         )
         final_status = RunStatus.COMPLETED
         try:
-            await _run_single_item(session.id, index, item)
+            item_succeeded = await _run_single_item(session.id, index, item)
+            if not item_succeeded:
+                final_status = RunStatus.FAILED
+                any_item_failed = True
         except AppError as exc:
             logger.error(
                 "Item %d della sessione %s saltato: [%s] %s",
@@ -90,23 +114,20 @@ async def _run_items(session: Session) -> None:
                 exc.message,
             )
             final_status = RunStatus.FAILED
-            await results_service.create_result(
-                _skipped_item_result(session.id, item, exc.message)
-            )
+            any_item_failed = True
+            await _save_skipped_item_result(session.id, item, exc.message)
         except Exception as exc:
             logger.exception("Item %d della sessione %s interrotto", index, session.id)
             final_status = RunStatus.FAILED
-            await results_service.create_result(
-                _skipped_item_result(session.id, item, str(exc))
-            )
+            any_item_failed = True
+            await _save_skipped_item_result(session.id, item, str(exc))
         finally:
             await sessions_service.update_item_progress(session.id, index, status=final_status)
+    return not any_item_failed
 
 
-def _skipped_item_result(
-    session_id: str, item: SessionProgressItem, reason: str
-) -> ResultCreate:
-    """Costruisce il ``Result`` segnaposto per un item mai misurato.
+async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, reason: str) -> None:
+    """Tenta di salvare il ``Result`` segnaposto per un item mai misurato.
 
     Riceve:
         session_id: identificativo della sessione in esecuzione, salvato in
@@ -115,19 +136,35 @@ def _skipped_item_result(
         reason: messaggio dell'errore che ha impedito la misura.
 
     Restituisce:
-        Un ``ResultCreate`` con ``status="failed"``, tempi a zero e
-        ``actualProto=None``, coerente con come ``measurement.runner``
-        rappresenta un fallimento di misura.
+        ``None``.
 
     Fa:
-        Non ha un ``Target``/``Scenario`` risolti a disposizione (l'errore può
-        derivare proprio dalla loro risoluzione), quindi usa ``item.label`` e il
-        messaggio d'errore come snapshot leggibili al posto dei campi
-        denormalizzati abituali.
+        ``targetId`` è un riferimento obbligatorio in ``Result``: per
+        valorizzarlo occorre recuperare il ``SessionItem`` di configurazione
+        (l'errore che ha fatto saltare l'item può derivare dalla risoluzione
+        di Target/Scenario/Client, ma il ``SessionItem`` stesso — e quindi il
+        suo ``targetId`` — è di solito ancora leggibile). Se anche il
+        ``SessionItem`` non esiste più (cancellato dopo essere stato
+        referenziato da questa sessione), non c'è alcun target a cui legare
+        il risultato: il fallimento resta comunque nei log applicativi, ma
+        nessun ``Result`` viene creato per questo item.
     """
-    return ResultCreate(
+    try:
+        session_item = await session_items_service.get_session_item(item.session_item_id)
+    except AppError:
+        logger.warning(
+            "Nessun Result creato per l'item %d della sessione %s: "
+            "SessionItem '%s' non più risolvibile (targetId sconosciuto).",
+            item.done,
+            session_id,
+            item.session_item_id,
+        )
+        return
+
+    result = ResultCreate(
         sessionId=session_id,
         sessionItemId=item.session_item_id,
+        targetId=session_item.target_id,
         idx=item.done,
         target=item.label,
         scenarioPath=f"(non eseguito: {reason})",
@@ -139,9 +176,10 @@ def _skipped_item_result(
         status=ResultStatus.FAILED,
         time=datetime.now(UTC),
     )
+    await results_service.create_result(result)
 
 
-async def _run_single_item(session_id: str, index: int, item: SessionProgressItem) -> None:
+async def _run_single_item(session_id: str, index: int, item: SessionProgressItem) -> bool:
     """Esegue le ripetizioni di un singolo item di una sessione.
 
     Riceve:
@@ -150,7 +188,14 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         item: l'item di avanzamento, che referenzia il ``SessionItem``.
 
     Restituisce:
-        ``None``.
+        ``True`` se **tutte** le ripetizioni sono terminate con un ``Result``
+        ``status="completed"``, ``False`` se almeno una è ``"failed"``. Usato
+        da ``_run_items`` per decidere lo stato finale dell'item: un item i cui
+        tentativi sono tutti falliti (o anche solo in parte) non ha prodotto
+        una misura valida, e non deve risultare ``completed`` solo perché
+        ``done`` ha raggiunto ``total``. Questo è distinto dal caso — gestito
+        dal chiamante tramite eccezione — di un item mai eseguito perché la
+        configurazione era rotta o il client non supportato.
 
     Fa:
         Carica il ``SessionItem`` di configurazione, risolve target, scenario e
@@ -181,7 +226,11 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         context.url,
     )
 
+    any_rep_failed = False
     for idx in range(session_item.reps):
         result = await measurement_runner.measure_once(context, idx, session_id)
         await results_service.create_result(result)
+        if result.status is ResultStatus.FAILED:
+            any_rep_failed = True
         await sessions_service.update_item_progress(session_id, index, done=idx + 1)
+    return not any_rep_failed
