@@ -314,7 +314,7 @@ sessioni che riusavano quell'item), ora usa `sessionId + sessionItemId`.
 È l'**unico** punto del sistema che conosce la riga di comando di `curl`. La sua
 responsabilità è tradurre "misura questo URL con questo protocollo" in un
 processo esterno e riportarne l'esito in un oggetto di dominio
-(`CurlMeasurement`). È diviso in tre momenti.
+(`Measurement`). È diviso in tre momenti.
 
 **1. Costruzione del comando (`build_command`).**
 
@@ -342,7 +342,7 @@ margine lascia a `curl` la possibilità di terminare da solo e riportare
 l'errore; se il processo si blocca comunque, viene **ucciso e atteso**, per non
 lasciare zombie né bloccare l'intera sessione. Ogni tipo di fallimento (binario
 assente, errore di avvio, exit code ≠ 0, output non-JSON, timeout) è tradotto in
-un `CurlMeasurement` fallito tramite `_failed(...)`: **`measure` non solleva mai
+un `Measurement` fallito tramite `_failed(...)`: **`measure` non solleva mai
 eccezioni di rete**, così il chiamante può sempre salvare un `Result`.
 
 **3. Interpretazione dell'output (`_to_measurement`).** Qui sta la regola
@@ -483,7 +483,7 @@ sequenceDiagram
             MR->>CC: measure(url, proto, timeout)
             CC->>CURL: subprocess (curl ... url)
             CURL-->>CC: JSON timing (http_version, time_total, ...)
-            CC-->>MR: CurlMeasurement (completed|failed)
+            CC-->>MR: Measurement (completed|failed)
             MR-->>RUN: ResultCreate (con sessionId)
             RUN->>DB: insert Result + item.done += 1
         end
@@ -754,8 +754,9 @@ async def resolve_context(session_item):
 
 1. **Definire l'interfaccia comune (la "strategia").** Astrarre ciò che
    `curl_client` già espone: una funzione `measure(url, protocol, timeout_ms) ->
-   CurlMeasurement` (o un `Measurement` rinominato in modo neutro rispetto a
-   curl). È il **contratto** che ogni motore deve rispettare.
+   Measurement`. È il **contratto** che ogni motore deve rispettare — il nome
+   del tipo è già neutro rispetto a curl, proprio per essere condiviso fra più
+   motori.
 
 2. **Creare `measurement/chrome_client.py`** che implementa lo stesso contratto,
    producendo lo **stesso** `Measurement` (stesso set di campi: `succeeded`,

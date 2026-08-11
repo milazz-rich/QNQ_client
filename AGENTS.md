@@ -70,8 +70,9 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
         ├── results_service.py
         ├── measurement/       # esecuzione delle misure HTTP/2 e HTTP/3
         │   ├── __init__.py
-        │   ├── curl_client.py # invocazione di curl e parsing dei timing
-        │   └── runner.py      # entità del dominio → misura → Result
+        │   ├── curl_client.py   # motore "curl": processo esterno + parsing -w
+        │   ├── chrome_client.py # motore "chrome": Playwright + CDP
+        │   └── runner.py        # entità del dominio → motore → Result
         └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
 ```
 
@@ -79,8 +80,12 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
 > documento prevedeva `http2.py` e `http3.py` separati. Non è così: nella pratica
 > il protocollo è **un solo flag di curl** (`--http2` / `--http3`), quindi due
 > moduli sarebbero stati identici a meno di una riga. La differenza è confinata
-> in `curl_client._protocol_flag`. La divisione reale è per responsabilità:
-> `curl_client` parla con il processo esterno, `runner` parla con il dominio.
+> in `curl_client._protocol_flag`. La divisione reale è **per motore di misura**
+> (`curl_client`, `chrome_client`: ciascuno parla con il proprio processo
+> esterno) e **per responsabilità** (`runner` parla con il dominio e sceglie il
+> motore, senza sapere come questo lavori). I motori espongono lo stesso
+> contratto `measure(url, protocol, timeout_ms) -> Measurement` e sono
+> registrati in `runner.MEASUREMENT_BACKENDS`.
 
 ### Regola di stratificazione
 
@@ -99,10 +104,10 @@ routers/  →  services/  →  db/
 Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
 `POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
-lettura filtrata di `results`, il measurement service basato su curl e il
-session runner in background.
+lettura filtrata di `results`, il session runner in background e **due motori
+di misura**: `curl` (§5.2) e `chrome` (§5.6).
 
-Non ancora implementato: client diversi da `curl` (Chrome, Firefox), che
+Non ancora implementato: client diversi da `curl` e `chrome` (es. Firefox), che
 sollevano `NOT_IMPLEMENTED`; interruzione di una sessione già avviata.
 
 ---
@@ -354,7 +359,8 @@ Gerarchia in `app/core/errors.py`:
 
 `NotImplementedFeatureError` è deliberatamente distinta da un errore generico:
 serve a dire "il dominio prevede questo caso, il codice non ancora" — oggi vale
-per i client diversi da `curl`. Il frontend può così spiegare la situazione
+per i client diversi da `curl` e `chrome` (es. Firefox), cioè quelli assenti da
+`runner.MEASUREMENT_BACKENDS`. Il frontend può così spiegare la situazione
 all'utente invece di mostrare un errore opaco.
 
 Gli handler sono registrati in `register_exception_handlers(app)` e coprono
@@ -377,6 +383,8 @@ risposta di errore sfugga al formato comune.
 | `CURL_BINARY_PATH` | `~/curl/src/curl`            | binario curl con HTTP/2 **e** HTTP/3 |
 | `CURL_KILL_GRACE_MS` | `2000`                     | margine prima di uccidere il processo|
 | `CURL_CA_BUNDLE_PATH` | *(vuoto)*                | opzionale, certificato CA custom (`--cacert`) |
+| `CHROME_CERT_SPKI_HASH` | *(vuoto)*              | hash SPKI dei certificati self-signed fidati da Chrome; lista separata da virgole |
+| `CHROME_WAIT_UNTIL`  | `load`                        | `load` \| `commit` \| `domcontentloaded` |
 
 Il binario di default è una build custom di curl: quello di sistema in genere
 **non** ha HTTP/3. Verificare con `curl --version` che la riga `Features:`
@@ -394,6 +402,23 @@ Deliberatamente **non** si usa `-k`/`--insecure`: quello disabiliterebbe la
 verifica TLS per qualunque target, nascondendo anche problemi reali (es. un
 certificato scaduto su un target di produzione); `--cacert` estende invece
 l'insieme di CA fidate con una aggiuntiva, mantenendo la verifica attiva.
+
+`CHROME_CERT_SPKI_HASH` è l'equivalente di `CURL_CA_BUNDLE_PATH` per il motore
+Chrome, ma **non** è intercambiabile: Chrome non accetta un file di
+certificato, vuole l'hash SHA-256 (base64) della `SubjectPublicKeyInfo`. Si
+calcola dal certificato con:
+
+```bash
+openssl x509 -in CERT.crt -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl enc -base64
+```
+
+È modellata come **lista separata da virgole** (stesso trattamento `NoDecode`
+di `CORS_ORIGINS`) anche se oggi contiene un solo valore: ambienti diversi
+(Docker, KVM) usano certificati diversi, e Chrome accetta nativamente più hash
+nello stesso flag, quindi l'estensione non richiederà modifiche al codice.
+Perché sia obbligatorio proprio questo flag — e non il più ovvio
+`--ignore-certificate-errors` — vedi §5.6.
 
 `CORS_ORIGINS` è annotato `NoDecode`: senza, pydantic-settings tenterebbe di
 interpretare il valore come JSON prima dei validator e `CORS_ORIGINS=http://a`
@@ -602,6 +627,113 @@ Sul versante lettura, `GET /api/results` accetta sia `?sessionId=` (filtro
 `?sessionItemIds=` (lista comma-separated, mantenuto per compatibilità); i filtri
 si combinano in AND con `?scenarioPath=`.
 
+### 5.6 Motore di misura "chrome" (Playwright + CDP)
+
+Il secondo motore di misura, selezionabile creando un `Client` di nome
+`Chrome`. Guida **Chromium headless** via Playwright e legge i timing dagli
+eventi del dominio *Network* del Chrome DevTools Protocol. Espone lo stesso
+contratto di `curl_client` — `measure(url, protocol, timeout_ms)` →
+`Measurement` — ed è registrato in `runner.MEASUREMENT_BACKENDS`.
+
+#### Flag per protocollo
+
+A differenza di curl, il protocollo non è un flag della richiesta ma va imposto
+al **processo browser** all'avvio, quindi ogni misura richiede un browser nuovo:
+
+| Protocollo | Flag |
+| ---------- | ---- |
+| HTTP/2     | `--disable-quic` |
+| HTTP/3     | `--enable-quic --origin-to-force-quic-on=<host>:<porta>` |
+| *sempre*   | `--ignore-certificate-errors-spki-list=<hash>`, `--no-sandbox` |
+
+Tre dettagli verificati empiricamente, tutti non ovvi:
+
+* **`--ignore-certificate-errors` NON funziona.** Il flag generico fa fallire
+  l'handshake QUIC con `ERR_QUIC_PROTOCOL_ERROR`: HTTP/3 su un target
+  self-signed è misurabile **solo** con `--ignore-certificate-errors-spki-list`
+  (da `CHROME_CERT_SPKI_HASH`, §4.6). Anche `ignore_https_errors` del context
+  Playwright non basta: agisce via CDP a livello di pagina, non sull'handshake.
+* **L'origine per QUIC deve includere la porta.** Con `--origin-to-force-quic-on`
+  senza porta esplicita Chrome **ignora in silenzio** la forzatura e usa HTTP/2:
+  si otterrebbe una misura del protocollo sbagliato invece di un errore.
+  `chrome_client.build_browser_args` normalizza quindi a `host:porta`.
+* **La scoperta automatica di h3 non è affidabile.** Il target annuncia
+  `alt-svc: h3=":443"` anche quando lo si interroga su `:8444`; senza forzatura
+  esplicita Chrome resta su HTTP/2.
+
+Si usa il **Chrome completo** (`channel="chromium"`), non l'`headless-shell`:
+è la build con lo stack QUIC pieno.
+
+#### Fallimenti: due percorsi distinti
+
+Il fallback si comporta in modo **asimmetrico**, diversamente da curl:
+
+| Forzatura | Server che non parla quel protocollo | Comportamento |
+| --------- | ------------------------------------ | ------------- |
+| HTTP/2    | http/1.1-only | **fallback silenzioso**: risponde `200` con `protocol="http/1.1"` |
+| HTTP/3    | senza QUIC    | **eccezione**: `ERR_QUIC_PROTOCOL_ERROR`, nessuna risposta |
+
+Entrambi producono `status="failed"` ma per vie diverse: il primo dal controllo
+sul protocollo negoziato (stessa regola di §5.3 — `protocol` ∉ {`h2`, `h3`} ⇒
+misura non valida), il secondo dalla cattura dell'eccezione di navigazione.
+Anche l'assenza del browser o delle sue librerie di sistema produce un
+fallimento strutturato, mai un crash.
+
+#### Dati estratti dal CDP
+
+Si filtra l'evento con `type == "Document"`: un browser carica anche le
+sotto-risorse della pagina, che non vanno confuse con la misura del documento.
+
+| Campo `Result` | Origine CDP |
+| -------------- | ----------- |
+| `actualProto`  | `response.protocol` (`h2`/`h3` → HTTP/2 / HTTP/3) |
+| `ttfb`         | `response.timing.receiveHeadersStart` (già in ms) |
+| `total`        | `(loadingFinished.timestamp − timing.requestTime) × 1000` |
+| `kb`           | `loadingFinished.encodedDataLength / 1024` |
+
+`response.timing` espone anche la scomposizione completa dell'handshake
+(`dnsStart/End`, `connectStart/End`, `sslStart/End`, …), più granulare di quanto
+offra curl: su HTTP/3 `connectStart == sslStart`, perché in QUIC trasporto e
+crittografia sono lo stesso handshake. Non è oggi mappata su `Result`, ma è
+disponibile se servisse un'analisi più fine.
+
+#### Confrontabilità con curl — attenzione
+
+* **I byte NON sono comparabili 1:1.** curl riporta `size_download`, cioè il
+  **corpo** della risposta; Chrome riporta `encodedDataLength`, che **include
+  gli header compressi**. Sullo stesso documento da 232 B curl misura 232 B,
+  Chrome ~392 B su HTTP/2 e ~332 B su HTTP/3 — e la differenza fra i due
+  protocolli riflette HPACK vs QPACK, non una diversa quantità di dati utili.
+  Confrontare i `kb` fra client diversi è quindi privo di significato; il
+  confronto valido resta **fra protocolli a parità di client**.
+* **Il costo per misura è molto maggiore.** Avviare e chiudere un browser
+  completo costa **~1–2 s** contro i ~20 ms della richiesta vera (misurato:
+  4 misure in ~3 s end-to-end). Le sessioni con molte ripetizioni diventano
+  sensibilmente più lente che con curl. È il prezzo della fedeltà al
+  comportamento di un browser reale.
+* **Più varianza.** L'avvio del processo browser introduce rumore assente in
+  curl; conviene aumentare `reps` per compensare.
+
+#### Nota metodologica: `wait_until="load"`
+
+`CHROME_WAIT_UNTIL` decide quando la navigazione è considerata conclusa, e
+quindi **cosa** si sta misurando:
+
+* **`load` (default, scelta deliberata)** — attende anche le sotto-risorse
+  della pagina. È il punto in cui il motore Chrome dice qualcosa che curl non
+  può dire: come si comporta il protocollo su una pagina **con più risorse**,
+  dove il multiplexing di HTTP/2 e HTTP/3 conta davvero. Con una sola richiesta
+  isolata i due protocolli si distinguono poco; è il caricamento completo a
+  renderne visibile la differenza. È il motivo per cui questo motore esiste
+  accanto a curl.
+* `commit` / `domcontentloaded` — misurano il solo documento, più vicino a curl
+  e utile per un confronto diretto fra i due client, ma rinunciano proprio a ciò
+  che il browser aggiunge.
+
+Attenzione: con `load` su pagine molto pesanti il `timeout` del `SessionItem`
+deve essere generoso — è il tempo di caricamento dell'**intera pagina**, non
+della singola richiesta.
+
 ---
 
 ## 6. Comandi
@@ -618,6 +750,34 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 # Documentazione interattiva
 # http://localhost:8000/docs
+```
+
+### Setup aggiuntivo per il motore "chrome"
+
+`pip install` porta la libreria Playwright, **non** il browser né le librerie di
+sistema che gli servono. Servono due passi in più, entrambi obbligatori:
+
+```bash
+# 1. scarica il browser (~650 MB in ~/.cache/ms-playwright)
+playwright install chromium
+
+# 2. librerie di sistema richieste da Chromium (richiede sudo)
+sudo apt-get install -y libnss3 libnspr4 libasound2t64
+```
+
+In alternativa al passo 2, `sudo playwright install-deps chromium` installa
+l'intero set di dipendenze (più ampio del necessario).
+
+Senza il passo 2 Chromium non si avvia: le misure con client `Chrome`
+falliscono in modo pulito (`Result` con `status="failed"` ed errore *"Chromium
+non utilizzabile: … error while loading shared libraries: libnspr4.so"*), senza
+compromettere il resto della sessione né le misure con curl. Se le misure
+Chrome falliscono tutte con quel messaggio, è quasi sempre il passo 2 mancante.
+
+Verifica rapida che l'ambiente sia a posto:
+
+```bash
+python -c "import asyncio; from app.services.measurement import chrome_client; from app.models.target import Protocol; print(asyncio.run(chrome_client.measure('https://milaz.it:8444/', Protocol.HTTP3, 15000)))"
 ```
 
 ---

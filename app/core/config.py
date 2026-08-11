@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -38,12 +38,42 @@ class Settings(BaseSettings):
     curl_kill_grace_ms: int = Field(default=2000, ge=0)
     curl_ca_bundle_path: str = Field(default="")
 
+    # ``NoDecode`` per la stessa ragione di ``cors_origins`` (vedi sotto): senza,
+    # pydantic-settings tenterebbe di interpretare il valore come JSON.
+    # È una lista fin da ora — un solo hash oggi, ma ambienti diversi (Docker,
+    # KVM) useranno certificati diversi e Chrome accetta nativamente più hash
+    # separati da virgola nel flag --ignore-certificate-errors-spki-list.
+    chrome_cert_spki_hash: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    chrome_wait_until: Literal["load", "commit", "domcontentloaded"] = Field(default="load")
+
     # ``NoDecode`` disattiva il parsing JSON che pydantic-settings applicherebbe
     # ai campi complessi prima dei validator: senza, ``CORS_ORIGINS=http://a``
     # farebbe fallire l'avvio con un JSONDecodeError.
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:4200"]
     )
+
+    @field_validator("chrome_cert_spki_hash", mode="before")
+    @classmethod
+    def _split_spki_hashes(cls, value: object) -> object:
+        """Accetta gli hash SPKI come stringa separata da virgole.
+
+        Riceve:
+            value: il valore grezzo letto dall'ambiente (stringa o lista).
+
+        Restituisce:
+            Una lista di hash se l'input era una stringa, altrimenti il valore
+            invariato.
+
+        Fa:
+            Permette di scrivere sia ``CHROME_CERT_SPKI_HASH=abc=`` sia
+            ``CHROME_CERT_SPKI_HASH=abc=,def=`` nel ``.env``, senza doverlo
+            formattare come JSON. Un valore vuoto produce lista vuota (nessun
+            certificato custom fidato).
+        """
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -123,6 +153,28 @@ class Settings(BaseSettings):
         if not self.curl_ca_bundle_path:
             return ""
         return str(Path(self.curl_ca_bundle_path).expanduser())
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def chrome_spki_list(self) -> str:
+        """Valore del flag ``--ignore-certificate-errors-spki-list`` per Chrome.
+
+        Riceve:
+            Nulla (proprietà calcolata).
+
+        Restituisce:
+            Gli hash SPKI uniti da virgola, oppure stringa vuota se non è
+            configurato alcun certificato custom.
+
+        Fa:
+            Chrome accetta più hash separati da virgola in un solo flag, quindi
+            la lista di configurazione si mappa direttamente sul formato atteso
+            senza ulteriori trasformazioni. Verificato empiricamente che questo
+            flag è l'**unico** modo di far accettare un certificato self-signed
+            a QUIC: ``--ignore-certificate-errors`` (generico) fa fallire
+            l'handshake HTTP/3 con ``ERR_QUIC_PROTOCOL_ERROR``.
+        """
+        return ",".join(self.chrome_cert_spki_hash)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

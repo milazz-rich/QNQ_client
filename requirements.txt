@@ -3,3 +3,8 @@ uvicorn[standard]>=0.32
 motor>=3.6
 pydantic>=2.9
 pydantic-settings>=2.6
+# Client di misura "Chrome". Richiede due passi aggiuntivi oltre a pip install:
+#   playwright install chromium
+#   sudo apt-get install -y libnss3 libnspr4 libasound2t64
+# Vedi AGENTS.md §6.
+playwright>=1.62

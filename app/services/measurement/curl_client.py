@@ -37,7 +37,7 @@ _VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
 
 
 @dataclass(frozen=True)
-class CurlMeasurement:
+class Measurement:
     """Esito di una singola invocazione di curl.
 
     Attributi:
@@ -170,7 +170,7 @@ def _parse_write_out(raw: str) -> dict[str, object]:
     return payload
 
 
-def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeasurement:
+def _to_measurement(payload: dict[str, object], requested: Protocol) -> Measurement:
     """Converte i timing grezzi di curl nel modello di dominio.
 
     Riceve:
@@ -178,7 +178,7 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeas
         requested: il protocollo richiesto, usato per riconoscere il fallback.
 
     Restituisce:
-        Un ``CurlMeasurement`` con i tempi in millisecondi e i byte in kilobyte.
+        Un ``Measurement`` con i tempi in millisecondi e i byte in kilobyte.
         ``succeeded`` è ``True`` solo se è arrivata una risposta **e** il
         protocollo negoziato è HTTP/2 o HTTP/3; in tal caso ``actual_proto`` è
         valorizzato di conseguenza (può comunque differire da ``requested`` in
@@ -224,7 +224,7 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeas
                 negotiated.value,
             )
 
-    return CurlMeasurement(
+    return Measurement(
         succeeded=succeeded,
         actual_proto=negotiated if succeeded else None,
         total_ms=float(payload.get("time_total", 0.0) or 0.0) * 1000 if succeeded else 0.0,
@@ -235,7 +235,7 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> CurlMeas
     )
 
 
-def _failed(protocol: Protocol, error: str) -> CurlMeasurement:
+def _failed(protocol: Protocol, error: str) -> Measurement:
     """Costruisce l'esito di una misurazione fallita.
 
     Riceve:
@@ -243,14 +243,14 @@ def _failed(protocol: Protocol, error: str) -> CurlMeasurement:
         error: la descrizione del fallimento.
 
     Restituisce:
-        Un ``CurlMeasurement`` con ``succeeded=False`` e tempi azzerati.
+        Un ``Measurement`` con ``succeeded=False`` e tempi azzerati.
 
     Fa:
         Garantisce che ogni tentativo produca comunque un esito strutturato: il
         session runner deve poter salvare un ``Result`` con ``status="failed"``
         invece di saltare silenziosamente la ripetizione.
     """
-    return CurlMeasurement(
+    return Measurement(
         succeeded=False,
         actual_proto=None,
         total_ms=0.0,
@@ -265,7 +265,7 @@ async def measure(
     url: str,
     protocol: Protocol,
     timeout_ms: int,
-) -> CurlMeasurement:
+) -> Measurement:
     """Esegue una singola misurazione invocando il binario curl.
 
     Riceve:
@@ -274,7 +274,7 @@ async def measure(
         timeout_ms: timeout della richiesta in millisecondi, dal ``SessionItem``.
 
     Restituisce:
-        Un ``CurlMeasurement``: mai un'eccezione per un fallimento di rete, così
+        Un ``Measurement``: mai un'eccezione per un fallimento di rete, così
         che il chiamante possa registrare il risultato come ``failed``.
 
     Fa:

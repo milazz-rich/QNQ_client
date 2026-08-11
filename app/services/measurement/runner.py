@@ -7,6 +7,7 @@ di curl e produce il ``Result`` corrispondente.
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import ModuleType
 
 from app.core.errors import NotImplementedFeatureError
 from app.models.result import ResultCreate, ResultStatus
@@ -14,13 +15,25 @@ from app.models.scenario import Scenario
 from app.models.session_item import SessionItem
 from app.models.target import Target
 from app.services import clients_service, scenarios_service, targets_service
-from app.services.measurement import curl_client
+from app.services.measurement import chrome_client, curl_client
 
 logger = logging.getLogger(__name__)
 
-# Unico client supportato: il confronto è case-insensitive per tolleranza
-# sull'input dell'utente, ma il nome deve corrispondere esattamente a "curl".
-SUPPORTED_CLIENT = "curl"
+# Motori di misura disponibili, indicizzati per nome del ``Client``. La chiave è
+# in minuscolo: il confronto è case-insensitive per tolleranza sull'input
+# dell'utente ("Chrome", "chrome", "CURL" sono equivalenti).
+#
+# Ogni modulo qui dentro deve esporre lo stesso contratto::
+#
+#     async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement
+#
+# È il punto di estensione del sistema: aggiungere un motore significa scrivere
+# un modulo che rispetti quel contratto e registrarlo qui, senza toccare né i
+# router, né i service CRUD, né il session runner (vedi docs/ARCHITETTURA.md §6.2).
+MEASUREMENT_BACKENDS: dict[str, ModuleType] = {
+    "curl": curl_client,
+    "chrome": chrome_client,
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +46,9 @@ class MeasurementContext:
         scenario: il path da richiedere.
         url: l'URL già composto, costante per tutte le ripetizioni.
         target_label: snapshot leggibile del target, salvato in ogni ``Result``.
+        backend: il modulo che esegue materialmente la misura (``curl_client``
+            o ``chrome_client``), già risolto dal nome del ``Client``: le
+            ripetizioni non devono ridecidere quale motore usare.
     """
 
     session_item: SessionItem
@@ -40,6 +56,7 @@ class MeasurementContext:
     scenario: Scenario
     url: str
     target_label: str
+    backend: ModuleType
 
 
 async def resolve_context(session_item: SessionItem) -> MeasurementContext:
@@ -53,9 +70,10 @@ async def resolve_context(session_item: SessionItem) -> MeasurementContext:
 
     Fa:
         Carica ``Target``, ``Scenario`` e ``Client`` dal database — sollevando
-        ``NotFoundError`` se uno dei riferimenti è rotto — e verifica che il
-        client sia ``curl``. Per qualunque altro client (Chrome, Firefox)
-        solleva ``NotImplementedFeatureError`` (HTTP 501, codice
+        ``NotFoundError`` se uno dei riferimenti è rotto — e risolve il nome del
+        client nel motore di misura corrispondente tramite
+        ``MEASUREMENT_BACKENDS``. Un client non presente nella mappa (es.
+        Firefox) solleva ``NotImplementedFeatureError`` (HTTP 501, codice
         ``NOT_IMPLEMENTED``) invece di un errore generico, così che il frontend
         possa spiegare all'utente che quel motore non è ancora disponibile.
         La risoluzione avviene una sola volta per session item, non a ogni
@@ -65,13 +83,17 @@ async def resolve_context(session_item: SessionItem) -> MeasurementContext:
     scenario = await scenarios_service.get_scenario(session_item.scenario_id)
     client = await clients_service.get_client(session_item.client_id)
 
-    if client.name.strip().lower() != SUPPORTED_CLIENT:
+    backend = MEASUREMENT_BACKENDS.get(client.name.strip().lower())
+    if backend is None:
+        supported = ", ".join(sorted(MEASUREMENT_BACKENDS))
         raise NotImplementedFeatureError(
-            f"Il client '{client.name}' non è supportato: al momento è "
-            f"implementato solo '{SUPPORTED_CLIENT}'.",
+            f"Il client '{client.name}' non è supportato: al momento sono "
+            f"implementati solo {supported}.",
             details={"clientId": client.id, "clientName": client.name},
         )
 
+    # La composizione dell'URL è identica per ogni motore: sta in curl_client
+    # solo perché è dove è nata, non perché sia specifica di curl.
     url = curl_client.build_url(target.host, target.port, scenario.path)
     return MeasurementContext(
         session_item=session_item,
@@ -79,6 +101,7 @@ async def resolve_context(session_item: SessionItem) -> MeasurementContext:
         scenario=scenario,
         url=url,
         target_label=f"{target.name} ({target.host}:{target.port})",
+        backend=backend,
     )
 
 
@@ -97,7 +120,8 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         ``completed`` o ``failed``.
 
     Fa:
-        Invoca curl tramite ``curl_client.measure`` e traduce l'esito nel
+        Invoca il motore di misura risolto in ``context.backend`` (curl o
+        Chrome) e traduce l'esito nel
         modello ``Result``. Un fallimento non solleva eccezioni: produce un
         risultato con ``status="failed"``, tempi a zero e ``actualProto=None``,
         in modo che l'esecuzione della sessione prosegua e il fallimento resti
@@ -111,7 +135,7 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         è preso da ``context.target.id``, già risolto da ``resolve_context``.
     """
     item = context.session_item
-    measurement = await curl_client.measure(
+    measurement = await context.backend.measure(
         url=context.url,
         protocol=context.target.protocol,
         timeout_ms=item.timeout,
