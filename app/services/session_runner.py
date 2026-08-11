@@ -6,12 +6,17 @@ l'avanzamento in tempo reale.
 
 Le misurazioni sono eseguite **in sequenza**, mai in parallelo: due richieste
 concorrenti si contenderebbero la banda e falserebbero il confronto fra HTTP/2 e
-HTTP/3, che è l'unica cosa che questa applicazione deve misurare.
+HTTP/3, che è l'unica cosa che questa applicazione deve misurare. Fra una
+ripetizione e la successiva viene inserita una pausa fissa
+(``settings.measurement_delay_ms``), applicata sempre e per ogni combinazione
+di client/target/protocollo: vedi ``_run_single_item`` e AGENTS.md §5.3.
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
+from app.core.config import settings
 from app.core.errors import AppError
 from app.models.result import ResultCreate, ResultStatus
 from app.models.session import RunStatus, Session, SessionProgressItem
@@ -174,6 +179,7 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
         total=0.0,
         ttfb=0.0,
         kb=0.0,
+        responseCode=0,
         status=ResultStatus.FAILED,
         time=datetime.now(UTC),
     )
@@ -205,11 +211,17 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         sessione** per questo item — scoping per ``(sessionId, sessionItemId)``,
         non per solo ``sessionItemId``: il ``SessionItem`` può essere condiviso
         da altre sessioni, i cui risultati non vanno toccati — e poi esegue
-        ``reps`` misurazioni. Dopo ogni ripetizione salva il ``Result`` e
-        incrementa ``done`` sul database, così che il polling del frontend veda
-        l'avanzamento progredire. Il campo ``total`` è riallineato a ``reps``
-        prima di partire, perché è il ``SessionItem`` la fonte di verità sul
-        numero di ripetizioni.
+        ``reps`` misurazioni. Dopo ogni ripetizione salva il ``Result``,
+        incrementa ``done`` sul database (così che il polling del frontend veda
+        l'avanzamento progredire) e attende ``settings.measurement_delay_ms``
+        prima della ripetizione successiva — sempre, riuscita o fallita che sia
+        la misura appena fatta, per qualunque client/target/protocollo: la
+        pausa mitiga il rate limiter sulle nuove connessioni osservato su
+        OpenLiteSpeed (§5.3 di AGENTS.md), ma è deliberatamente uniforme e non
+        condizionata al caso specifico, per non introdurre una variabile in più
+        fra i dati raccolti su target diversi. Il campo ``total`` è riallineato
+        a ``reps`` prima di partire, perché è il ``SessionItem`` la fonte di
+        verità sul numero di ripetizioni.
     """
     session_item = await session_items_service.get_session_item(item.session_item_id)
     context = await measurement_runner.resolve_context(session_item)
@@ -234,4 +246,5 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         if result.status is ResultStatus.FAILED:
             any_rep_failed = True
         await sessions_service.update_item_progress(session_id, index, done=idx + 1)
+        await asyncio.sleep(settings.measurement_delay_ms / 1000)
     return not any_rep_failed

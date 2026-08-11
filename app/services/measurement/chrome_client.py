@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 from app.core.config import settings
 from app.models.target import Protocol
-from app.services.measurement.curl_client import Measurement
+from app.services.measurement.curl_client import Measurement, is_http_success
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +123,11 @@ def _to_measurement(response: dict[str, Any], finished: dict[str, Any]) -> Measu
 
     Restituisce:
         Un ``Measurement`` con tempi in millisecondi e byte in kilobyte.
-        ``succeeded`` è ``True`` solo se è arrivata una risposta **e** il
-        protocollo negoziato è HTTP/2 o HTTP/3.
+        ``succeeded`` è ``True`` solo se è arrivata una risposta, il protocollo
+        negoziato è HTTP/2 o HTTP/3 **e** lo status HTTP è 2xx (stesso criterio
+        di ``curl_client``, vedi ``is_http_success``): un ``403`` di un rate
+        limiter arriva regolarmente col protocollo corretto e non deve
+        registrarsi come misura valida solo per quello.
 
     Fa:
         Ricava il tempo totale dalla differenza fra il ``timestamp`` di
@@ -133,14 +136,16 @@ def _to_measurement(response: dict[str, Any], finished: dict[str, Any]) -> Measu
         in millisecondi relativi a ``requestTime``. I byte vengono da
         ``encodedDataLength``, che a differenza di ``size_download`` di curl
         **include gli header compressi**: i due valori non sono confrontabili
-        1:1 fra i due client (vedi AGENTS.md §5.6).
+        1:1 fra i due client (vedi AGENTS.md §5.6). ``response_code`` è
+        popolato sempre, anche sui fallimenti.
     """
     raw_protocol = str(response.get("protocol", ""))
     negotiated = _VALID_NEGOTIATED_PROTOCOLS.get(raw_protocol)
     status = int(response.get("status", 0) or 0)
     timing = response.get("timing") or {}
     got_response = status > 0 and bool(timing)
-    succeeded = got_response and negotiated is not None
+    protocol_ok = got_response and negotiated is not None
+    succeeded = protocol_ok and is_http_success(status)
 
     if not got_response:
         error = "Nessuna risposta utilizzabile ricevuta dal server."
@@ -152,6 +157,13 @@ def _to_measurement(response: dict[str, Any], finished: dict[str, Any]) -> Measu
         logger.warning(
             "Misura scartata, protocollo negoziato non valido (Chrome, protocol=%s)",
             raw_protocol or "sconosciuto",
+        )
+    elif not succeeded:
+        error = f"Il server ha risposto con un errore: HTTP {status}."
+        logger.warning(
+            "Misura scartata, risposta HTTP non di successo (Chrome, protocollo %s, codice %d)",
+            negotiated.value,
+            status,
         )
     else:
         error = None

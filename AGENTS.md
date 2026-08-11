@@ -232,6 +232,7 @@ Esito di una singola ripetizione.
 | `total`         | `float`                    | ms, ≥ 0, durata totale                   |
 | `ttfb`          | `float`                    | ms, ≥ 0, time-to-first-byte              |
 | `kb`            | `float`                    | ≥ 0, kilobyte trasferiti                 |
+| `responseCode`  | `int \| null`              | ≥ 0, codice HTTP effettivo; `null` solo sui `Result` precedenti all'introduzione del campo |
 | `status`        | `"completed" \| "failed"`  | esito                                    |
 | `time`          | `datetime`                 | UTC, istante di completamento            |
 
@@ -274,6 +275,16 @@ matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
 > aggiornati con un backfill idempotente che ricava il valore dal `SessionItem`
 > referenziato. Se in futuro si aggiungesse un altro riferimento obbligatorio a
 > `Result`, va previsto lo stesso passaggio prima di rimettere in servizio l'API.
+>
+> `responseCode` ha seguito un percorso diverso, deliberatamente: è
+> **opzionale** (`int | None`), non obbligatorio. Un backfill avrebbe dovuto
+> *indovinare* il valore storico — e non è un'ipotesi neutra: prima
+> dell'introduzione di questo campo il criterio di successo non controllava lo
+> status HTTP (vedi sotto), quindi un `Result` "completed" storico potrebbe in
+> realtà essere stato un `403` non rilevato. Presumere `200` per tutti i
+> `completed` avrebbe nascosto esattamente il problema che questo campo esiste
+> per rendere visibile. Meglio `null` onesto ("non registrato all'epoca") che
+> un numero plausibile ma inventato su un dataset di misure reali.
 
 ### 3.4 Pattern dei modelli Pydantic
 
@@ -401,6 +412,7 @@ risposta di errore sfugga al formato comune.
 | `CURL_CA_BUNDLE_PATH` | *(vuoto)*                | opzionale, certificato CA custom (`--cacert`) |
 | `CHROME_CERT_SPKI_HASH` | *(vuoto)*              | hash SPKI dei certificati self-signed fidati da Chrome; lista separata da virgole |
 | `CHROME_WAIT_UNTIL`  | `load`                        | `load` \| `commit` \| `domcontentloaded` |
+| `MEASUREMENT_DELAY_MS` | `300`                       | pausa fra ripetizioni, uniforme per ogni client/target/protocollo (§5.1) |
 
 Il binario di default è una build custom di curl: quello di sistema in genere
 **non** ha HTTP/3. Verificare con `curl --version` che la riga `Features:`
@@ -472,6 +484,7 @@ POST /api/sessions/{id}/start
         cancella i Result di una precedente run DI QUESTA sessione (sessionId+item)
         per ogni ripetizione:
           curl → Result (con sessionId = questa sessione) salvato → item.done += 1
+          attesa fissa di MEASUREMENT_DELAY_MS prima della ripetizione successiva
         item.status = completed SE tutte le ripetizioni hanno prodotto Result "completed"
         item.status = failed    SE almeno una ripetizione ha prodotto Result "failed"
         (se la risoluzione fallisce in modo irrecuperabile PRIMA di eseguire
@@ -499,6 +512,18 @@ positivo. Anche un'eccezione imprevista *prima* che gli item vengano eseguiti
 `done` è incrementato sul database dopo *ogni* ripetizione, con update mirato
 `items.<i>.done` (non riscrittura dell'array): è ciò che permette al polling del
 frontend su `GET /api/sessions/{id}` di mostrare l'avanzamento in tempo reale.
+
+**Pausa fra ripetizioni (`MEASUREMENT_DELAY_MS`).** Dopo ogni ripetizione —
+riuscita o fallita — `session_runner._run_single_item` attende
+`settings.measurement_delay_ms` (default `300` ms) prima di lanciare la
+successiva. La pausa è **sempre la stessa**, per qualunque combinazione di
+client (curl o Chrome), target e protocollo: non è condizionata al caso
+specifico (es. "solo su OpenLiteSpeed", o "solo se la precedente è fallita"),
+perché differenziarla introdurrebbe una variabile in più fra i dati raccolti
+su target diversi, minando proprio la comparabilità che l'applicazione esiste
+per garantire. Motivata da un rate limiter per-IP verificato empiricamente su
+OpenLiteSpeed (§5.3): senza pausa, ripetizioni ravvicinate su quel target
+ricevevano regolarmente `403` pur negoziando il protocollo corretto.
 
 ### 5.2 Comando curl
 
@@ -533,7 +558,7 @@ già aperta. Questo è coerente fra i due protocolli — nessuno dei due benefic
 di riuso — quindi non falsa il confronto relativo, ma va ricordato se questi
 numeri vengono confrontati con misure esterne che invece riusano la connessione.
 
-### 5.3 Fallback di protocollo
+### 5.3 Fallback di protocollo e criterio di successo
 
 `--http2` e `--http3` **non sono vincolanti**: chiedono il protocollo ma
 accettano quello che il server negozia. Il fallback fra HTTP/2 e HTTP/3 (i due
@@ -550,18 +575,41 @@ Verificato empiricamente:
 | `--http2`   | `ftp.gnu.org` (no h2)   | `1.1`          | `failed`, `actualProto` = `null` |
 | `--http3`   | `ftp.gnu.org` (no QUIC) | `1.1`          | `failed`, `actualProto` = `null` |
 
+**Il protocollo negoziato da solo non basta.** Serve anche uno status HTTP di
+successo (`is_http_success`, in `curl_client.py` e condivisa da
+`chrome_client.py`): **2xx**, altrimenti la misura è `failed` anche se
+`actualProto` è HTTP/2 o HTTP/3. Verificato empiricamente durante l'indagine
+su un rate limiter per-IP di LiteSpeed: connessioni HTTP/2 ravvicinate possono
+ricevere un `403` mantenendo `http_version=2` — protocollo corretto, ma non è
+una misura valida della pagina richiesta.
+
+| Richiesta   | Server                          | `http_version` | `response_code` | Esito |
+| ----------- | -------------------------------- | -------------- | ---------------- | ----- |
+| `--http2`   | rate limiter attivo (`403`)      | `2`             | `403`             | `failed`, `actualProto` = `null` |
+| `--http2`   | risposta normale (`200`)         | `2`             | `200`             | `completed`, `actualProto` = HTTP/2 |
+
+Questo criterio **rileva** il rate limiter, ma da solo non lo evita. La
+mitigazione è `MEASUREMENT_DELAY_MS` (§5.1): una pausa fissa fra ripetizioni,
+applicata sempre e per ogni target — non solo su OpenLiteSpeed — per non
+introdurre una differenza metodologica fra i target che invaliderebbe il
+confronto.
+
 Il campo `proto` di `Result` conserva **sempre** il protocollo richiesto.
-`actualProto` è valorizzato **solo** quando `status="completed"`, e in quel
-caso è sempre HTTP/2 o HTTP/3 — non può contenere HTTP/1.1 né altri valori:
-se il protocollo negoziato non è uno dei due, l'intero `Result` è `failed` e
-`actualProto` resta `null`. Questo evita l'errore opposto rispetto a prima:
-un confronto che leggesse `total`/`ttfb` senza controllare `status` non può
-più scambiare per dati validi una richiesta caduta su HTTP/1.1.
+`actualProto` è valorizzato **solo** quando `status="completed"` (protocollo
+corretto **e** 2xx), e in quel caso è sempre HTTP/2 o HTTP/3 — non può
+contenere HTTP/1.1 né altri valori. `responseCode` invece è popolato **sempre**,
+riuscita o no, con il codice HTTP effettivo (`0` se nessuna risposta è
+arrivata): è il campo da guardare per distinguere un errore di rete da un
+errore applicativo del server, cosa che `status="failed"` da solo non dice.
+Questo evita l'errore opposto rispetto a prima: un confronto che leggesse
+`total`/`ttfb` senza controllare `status` non può più scambiare per dati validi
+né una richiesta caduta su HTTP/1.1 né una pagina di errore del server.
 
 Esiste `--http3-only` per la modalità strict (fallire invece di ripiegare): non
 è usato, perché il requisito è **rilevare** il fallback fra HTTP/2 e HTTP/3
 (tramite `actualProto`), non impedirlo — mentre un fallback fuori da questi
-due protocolli è comunque un fallimento, rilevato tramite `status="failed"`.
+due protocolli, o una risposta di errore, sono comunque un fallimento,
+rilevato tramite `status="failed"`.
 
 ### 5.4 Fallimenti
 
@@ -572,6 +620,9 @@ Una misura fallita non interrompe mai l'esecuzione: produce un `Result` con
 * curl esce con 0 ma `response_code` è 0 (nessuna risposta);
 * curl riceve una risposta ma il protocollo negoziato non è HTTP/2 né HTTP/3
   (fallback su HTTP/1.1, o `http_version` non riconosciuto) — vedi §5.3;
+* curl riceve una risposta con protocollo corretto ma `response_code` non 2xx
+  (es. `403`, `500`): il protocollo da solo non certifica una misura valida —
+  vedi §5.3;
 * l'output di `-w` non è JSON interpretabile;
 * il binario curl non esiste al path configurato;
 * il processo non termina entro `--max-time` + `CURL_KILL_GRACE_MS`: viene
@@ -691,6 +742,59 @@ sul protocollo negoziato (stessa regola di §5.3 — `protocol` ∉ {`h2`, `h3`}
 misura non valida), il secondo dalla cattura dell'eccezione di navigazione.
 Anche l'assenza del browser o delle sue librerie di sistema produce un
 fallimento strutturato, mai un crash.
+
+#### Fallimento noto: `ERR_CERT_VERIFIER_CHANGED`
+
+Occasionalmente una misura fallisce con `net::ERR_CERT_VERIFIER_CHANGED`, un
+errore Chromium legato al servizio interno di verifica dei certificati.
+Indagato empiricamente perché a prima vista sembrerebbe collegato al lancio
+ravvicinato di istanze Chrome (ogni ripetizione ne avvia una nuova, §5.1) o a
+una `user-data-dir` non isolata fra ripetizioni — nessuna delle due ipotesi ha
+retto alla verifica diretta:
+
+* **Tasso**: `1/300 = 0,33%` (IC95% 0,06–1,86%), su misure reali contro un
+  target di test (Caddy, HTTP/2), con lo stesso `chrome_client.measure()` in
+  uso in produzione.
+* **Concorrenza fra istanze — esclusa.** Un poller di processi in background
+  (campionamento ogni 20ms della cmdline reale via `ps`, non un'ipotesi) non
+  ha mai rilevato il processo di una ripetizione ancora vivo al lancio della
+  successiva, incluso l'istante esatto dell'unico fallimento osservato:
+  `browser.close()` risulta aver atteso davvero la terminazione del processo
+  prima di ritornare.
+* **Isolamento `user-data-dir` — confermato.** Verificato dalla cmdline reale
+  dei processi (non assunto): ogni lancio riceve una directory temporanea con
+  suffisso casuale generata da Playwright, mai passata esplicitamente da
+  `chrome_client.py`. Su 450 misure osservate, nessun riuso genuino della
+  stessa directory fra ripetizioni non adiacenti.
+* **Ritardo fra un lancio e l'altro — nessun beneficio misurabile per QUESTO
+  errore.** Testato con 150ms di pausa fra la chiusura di un'istanza e l'avvio
+  della successiva: `0/150` fallimenti, contro l'`1/300` del caso base. Fisher
+  exact test `p = 1,000`: nessuna differenza statisticamente significativa (con
+  un evento così raro servirebbero migliaia di campioni per condizione per
+  distinguere in modo affidabile un eventuale effetto reale dal rumore
+  campionario). All'epoca di questa indagine nessun ritardo sistematico era
+  stato introdotto proprio per `ERR_CERT_VERIFIER_CHANGED`: non c'era prova
+  che aiutasse, a fronte di un costo certo per mitigare un evento che capita 3
+  volte su 1000. Da allora `MEASUREMENT_DELAY_MS` (§5.1) è stato comunque
+  introdotto, ma per un problema **diverso e confermato** (il rate limiter di
+  OpenLiteSpeed, §5.3) — come effetto collaterale riduce anche il rischio di
+  qualunque race legata al lancio ravvicinato, incluso in teoria questo caso,
+  ma resta un fallimento noto e occasionale da tenere presente, non qualcosa
+  che ci si aspetta di eliminare del tutto.
+
+**Causa più probabile**: una race condition rara interna al network stack di
+Chromium durante l'inizializzazione del servizio di verifica certificati su un
+profilo nuovo — plausibile perché ogni misura è, per costruzione (§5.1), un
+profilo Chrome mai usato prima, quindi quel servizio parte da zero a ogni
+singola ripetizione. Non è quindi imputabile a come l'applicazione gestisce il
+ciclo di vita delle istanze, né al target di test.
+
+**Nessun fix applicativo necessario.** Il fallimento è già gestito
+correttamente dal percorso HTTP/3 esistente (eccezione di navigazione
+catturata, vedi tabella sopra): produce un `Measurement` con
+`succeeded=False`, che diventa un `Result` con `status="failed"` — nessun
+crash, nessuna sessione bloccata, nessun dato silenziosamente perso o
+scambiato per una misura valida.
 
 #### Dati estratti dal CDP
 

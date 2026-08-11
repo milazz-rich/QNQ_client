@@ -36,22 +36,47 @@ _VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
 }
 
 
+def is_http_success(response_code: int) -> bool:
+    """Indica se un codice di stato HTTP rappresenta un successo applicativo.
+
+    Riceve:
+        response_code: il codice numerico riportato da curl.
+
+    Restituisce:
+        ``True`` solo per la classe 2xx.
+
+    Fa:
+        Il protocollo può essere negoziato correttamente anche quando il
+        server risponde con un errore (verificato empiricamente: un rate
+        limiter per-IP di LiteSpeed produce ``403`` su connessioni HTTP/2
+        ravvicinate, con `http_version` comunque `"2"`). Una misura che riceve
+        un errore applicativo non è una misura valida della pagina richiesta,
+        quindi non basta un protocollo negoziato corretto — serve anche un
+        esito HTTP di successo. 3xx, 4xx e 5xx contano come fallimento.
+    """
+    return 200 <= response_code < 300
+
+
 @dataclass(frozen=True)
 class Measurement:
     """Esito di una singola invocazione di curl.
 
     Attributi:
-        succeeded: ``True`` se curl ha ricevuto una risposta **e** il
-            protocollo negoziato è HTTP/2 o HTTP/3. Un fallback su HTTP/1.1 (o
-            un protocollo non determinabile) conta come fallimento anche se
-            curl è uscito con successo: non è una misura valida del protocollo
-            richiesto.
+        succeeded: ``True`` se curl ha ricevuto una risposta, il protocollo
+            negoziato è HTTP/2 o HTTP/3 **e** il codice di stato è 2xx. Un
+            fallback su HTTP/1.1, un protocollo non determinabile, o un
+            errore applicativo (es. ``403``/``500`` con protocollo corretto)
+            contano tutti come fallimento: nessuno dei tre è una misura valida
+            della pagina richiesta.
         actual_proto: protocollo effettivamente negoziato, solo se
             ``succeeded`` (sempre e solo HTTP/2 o HTTP/3); ``None`` altrimenti.
         total_ms: durata totale della richiesta in millisecondi.
         ttfb_ms: time-to-first-byte in millisecondi.
         kb: kilobyte scaricati.
-        response_code: codice di stato HTTP, ``0`` se la richiesta non è arrivata.
+        response_code: codice di stato HTTP effettivamente ricevuto, ``0`` se
+            la richiesta non è arrivata. Popolato **sempre**, anche quando
+            ``succeeded`` è ``False``: è ciò che permette di distinguere un
+            errore di rete da un errore applicativo del server.
         error: descrizione del fallimento, ``None`` se andata a buon fine.
     """
 
@@ -179,28 +204,36 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> Measurem
 
     Restituisce:
         Un ``Measurement`` con i tempi in millisecondi e i byte in kilobyte.
-        ``succeeded`` è ``True`` solo se è arrivata una risposta **e** il
-        protocollo negoziato è HTTP/2 o HTTP/3; in tal caso ``actual_proto`` è
-        valorizzato di conseguenza (può comunque differire da ``requested`` in
-        caso di fallback fra i due). Altrimenti ``succeeded=False`` e
-        ``actual_proto=None``: un fallback su HTTP/1.1 non è una misura valida
-        del protocollo richiesto, anche se curl ha ricevuto una risposta.
+        ``succeeded`` è ``True`` solo se è arrivata una risposta, il protocollo
+        negoziato è HTTP/2 o HTTP/3 **e** il codice di stato è 2xx; in tal caso
+        ``actual_proto`` è valorizzato di conseguenza (può comunque differire
+        da ``requested`` in caso di fallback fra i due). Altrimenti
+        ``succeeded=False`` e ``actual_proto=None``: né un fallback su
+        HTTP/1.1 né un errore applicativo (4xx/5xx) con protocollo corretto
+        sono una misura valida della pagina richiesta.
 
     Fa:
         curl riporta i tempi in secondi e la dimensione in byte: qui vengono
         convertiti nelle unità del modello ``Result`` (ms e KB). Un
         ``response_code`` pari a 0 significa che nessuna risposta è arrivata e
         viene trattato come fallimento anche se il processo è uscito con 0.
-        Tempi e byte sono azzerati anche nel caso di fallback su HTTP/1.1,
-        coerentemente con ogni altro fallimento: non essendo una misura del
-        protocollo richiesto, i numeri non devono poter essere scambiati per
-        dati validi da chi legge solo `total`/`ttfb` senza controllare `status`.
+        Il protocollo negoziato non basta da solo: un `403` di un rate limiter
+        (§5.3 di AGENTS.md) arriva regolarmente su HTTP/2, quindi occorre
+        controllare anche ``is_http_success``. Tempi e byte sono azzerati in
+        ogni caso di fallimento, coerentemente: non essendo una misura valida,
+        i numeri non devono poter essere scambiati per dati validi da chi
+        legge solo `total`/`ttfb` senza controllare `status`. ``response_code``
+        resta invece **sempre** popolato con il valore effettivo, anche sui
+        fallimenti: è l'unico modo per capire a posteriori se un item è
+        fallito per un errore di rete (`response_code=0`) o per un errore
+        applicativo del server (`response_code` 4xx/5xx).
     """
     raw_version = str(payload.get("http_version", ""))
     negotiated = _VALID_NEGOTIATED_PROTOCOLS.get(raw_version)
     response_code = int(payload.get("response_code", 0) or 0)
     got_response = response_code > 0
-    succeeded = got_response and negotiated is not None
+    protocol_ok = got_response and negotiated is not None
+    succeeded = protocol_ok and is_http_success(response_code)
 
     if not got_response:
         error = "Nessuna risposta ricevuta dal server."
@@ -214,6 +247,13 @@ def _to_measurement(payload: dict[str, object], requested: Protocol) -> Measurem
             "http_version=%s)",
             requested.value,
             raw_version or "sconosciuto",
+        )
+    elif not succeeded:
+        error = f"Il server ha risposto con un errore: HTTP {response_code}."
+        logger.warning(
+            "Misura scartata, risposta HTTP non di successo (protocollo %s, codice %d)",
+            negotiated.value,
+            response_code,
         )
     else:
         error = None

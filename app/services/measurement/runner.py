@@ -130,14 +130,19 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         modello ``Result``. Un fallimento non solleva eccezioni: produce un
         risultato con ``status="failed"``, tempi a zero e ``actualProto=None``,
         in modo che l'esecuzione della sessione prosegua e il fallimento resti
-        visibile nei dati. Questo include il caso in cui curl riceve una
-        risposta ma il protocollo negoziato non è HTTP/2 né HTTP/3 (es.
-        fallback su HTTP/1.1): non è una misura valida del protocollo
-        richiesto, quindi conta come fallimento anche se la richiesta di rete
-        è andata a buon fine. Il campo ``proto`` conserva sempre il protocollo
-        *richiesto*; ``actualProto`` è valorizzato solo quando ``status`` è
-        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso. ``targetId`` e
-        ``clientId`` sono presi dalle entità già risolte da ``resolve_context``.
+        visibile nei dati. Questo include sia il caso in cui la risposta arriva
+        con un protocollo diverso da HTTP/2 o HTTP/3 (es. fallback su HTTP/1.1)
+        sia il caso in cui il protocollo è corretto ma lo status HTTP non è 2xx
+        (es. un `403` di un rate limiter, verificato empiricamente su un target
+        di test): nessuno dei due è una misura valida della pagina richiesta.
+        Il campo ``proto`` conserva sempre il protocollo *richiesto*;
+        ``actualProto`` è valorizzato solo quando ``status`` è ``completed``, ed
+        è sempre HTTP/2 o HTTP/3 in quel caso. ``responseCode`` è invece sempre
+        popolato, riuscita o no, con il codice di stato HTTP effettivo (``0``
+        se nessuna risposta è arrivata): è ciò che permette di distinguere a
+        posteriori un errore di rete da un errore applicativo del server.
+        ``targetId`` e ``clientId`` sono presi dalle entità già risolte da
+        ``resolve_context``.
     """
     item = context.session_item
     measurement = await context.backend.measure(
@@ -164,6 +169,7 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         total=measurement.total_ms,
         ttfb=measurement.ttfb_ms,
         kb=measurement.kb,
+        responseCode=measurement.response_code,
         status=ResultStatus.COMPLETED if measurement.succeeded else ResultStatus.FAILED,
         time=datetime.now(UTC),
     )

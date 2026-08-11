@@ -73,6 +73,24 @@ class ResultBase(MongoModel):
     total: float = Field(ge=0, description="Durata totale della richiesta in millisecondi")
     ttfb: float = Field(ge=0, description="Time-to-first-byte in millisecondi")
     kb: float = Field(ge=0, description="Kilobyte trasferiti")
+    response_code: int | None = Field(
+        default=None,
+        ge=0,
+        alias="responseCode",
+        description=(
+            "Codice di stato HTTP effettivamente ricevuto (0 se nessuna "
+            "risposta è arrivata, es. item mai eseguito o errore di rete). "
+            "Sempre visibile, indipendentemente da 'status': un 403 o un 500 "
+            "finiscono qui anche quando negoziano correttamente il protocollo "
+            "richiesto, perché non è quello a decidere se la misura è valida. "
+            "'null' compare solo sui Result creati prima dell'introduzione di "
+            "questo campo: il valore storico non è ricostruibile (con la "
+            "vecchia logica un 403 poteva essere registrato 'completed' senza "
+            "che il codice fosse mai salvato), quindi non si è tentato un "
+            "backfill indovinato. Ogni Result creato da qui in avanti lo ha "
+            "sempre valorizzato."
+        ),
+    )
     status: ResultStatus = Field(description="Esito della misura")
     time: datetime = Field(description="Istante di completamento, in UTC")
 

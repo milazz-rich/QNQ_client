@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     curl_kill_grace_ms: int = Field(default=2000, ge=0)
     curl_ca_bundle_path: str = Field(default="")
 
+    # Pausa fra una ripetizione e la successiva all'interno dello stesso
+    # SessionItem, applicata dal session_runner dopo OGNI ripetizione (riuscita
+    # o fallita), sempre allo stesso modo per qualunque client/target/protocollo
+    # (vedi AGENTS.md §5.1): mitiga il rate limiter sulle nuove connessioni di
+    # OpenLiteSpeed (verificato empiricamente, §5.3), ma va applicata in modo
+    # uniforme — non solo dove "serve" — perché differenziarla per caso
+    # specifico introdurrebbe una variabile in più fra i dati raccolti su
+    # target diversi, inficiando la comparabilità che è l'obiettivo primario
+    # dell'applicazione.
+    measurement_delay_ms: int = Field(default=300, ge=0)
+
     # ``NoDecode`` per la stessa ragione di ``cors_origins`` (vedi sotto): senza,
     # pydantic-settings tenterebbe di interpretare il valore come JSON.
     # È una lista fin da ora — un solo hash oggi, ma ambienti diversi (Docker,
