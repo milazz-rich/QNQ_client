@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from types import ModuleType
 
 from app.core.errors import NotImplementedFeatureError
+from app.models.client import Client
 from app.models.result import ResultCreate, ResultStatus
 from app.models.scenario import Scenario
 from app.models.session_item import SessionItem
@@ -44,6 +45,8 @@ class MeasurementContext:
         session_item: la configurazione della misura.
         target: il server sotto test.
         scenario: il path da richiedere.
+        client: il motore di misura scelto, come entità di dominio; il suo
+            ``id`` finisce in ``Result.clientId``.
         url: l'URL già composto, costante per tutte le ripetizioni.
         target_label: snapshot leggibile del target, salvato in ogni ``Result``.
         backend: il modulo che esegue materialmente la misura (``curl_client``
@@ -54,6 +57,7 @@ class MeasurementContext:
     session_item: SessionItem
     target: Target
     scenario: Scenario
+    client: Client
     url: str
     target_label: str
     backend: ModuleType
@@ -99,6 +103,7 @@ async def resolve_context(session_item: SessionItem) -> MeasurementContext:
         session_item=session_item,
         target=target,
         scenario=scenario,
+        client=client,
         url=url,
         target_label=f"{target.name} ({target.host}:{target.port})",
         backend=backend,
@@ -131,8 +136,8 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         richiesto, quindi conta come fallimento anche se la richiesta di rete
         è andata a buon fine. Il campo ``proto`` conserva sempre il protocollo
         *richiesto*; ``actualProto`` è valorizzato solo quando ``status`` è
-        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso. ``targetId``
-        è preso da ``context.target.id``, già risolto da ``resolve_context``.
+        ``completed``, ed è sempre HTTP/2 o HTTP/3 in quel caso. ``targetId`` e
+        ``clientId`` sono presi dalle entità già risolte da ``resolve_context``.
     """
     item = context.session_item
     measurement = await context.backend.measure(
@@ -150,6 +155,7 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         sessionId=session_id,
         sessionItemId=item.id,
         targetId=context.target.id,
+        clientId=context.client.id,
         idx=idx,
         target=context.target_label,
         scenarioPath=context.scenario.path,

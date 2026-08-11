@@ -7,7 +7,7 @@ non esistono ``POST``/``PUT``/``DELETE``.
 from fastapi import APIRouter, Path, Query
 
 from app.models.common import ErrorResponse
-from app.models.result import Result
+from app.models.result import Result, ResultPage
 from app.services import results_service
 
 router = APIRouter(
@@ -22,7 +22,7 @@ router = APIRouter(
 _ResultId = Path(description="Identificativo del risultato (24 caratteri esadecimali)")
 
 
-@router.get("", response_model=list[Result], summary="Elenca i risultati")
+@router.get("", response_model=ResultPage, summary="Elenca i risultati (paginato)")
 async def list_results(
     scenario_path: str | None = Query(
         default=None,
@@ -43,8 +43,23 @@ async def list_results(
             "senza ambiguità quando un SessionItem è condiviso fra più sessioni"
         ),
     ),
-) -> list[Result]:
-    """Restituisce i risultati, opzionalmente filtrati.
+    client_id: str | None = Query(
+        default=None,
+        alias="clientId",
+        description="Filtra per motore di misura che ha prodotto il risultato",
+    ),
+    page: int = Query(default=1, ge=1, description="Pagina richiesta, 1-based"),
+    page_size: int = Query(
+        default=results_service.DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=results_service.MAX_PAGE_SIZE,
+        alias="pageSize",
+        description=(
+            f"Risultati per pagina (max {results_service.MAX_PAGE_SIZE})"
+        ),
+    ),
+) -> ResultPage:
+    """Restituisce una pagina di risultati, opzionalmente filtrati.
 
     Riceve:
         scenario_path: valore di ``?scenarioPath=``, filtra per singolo scenario.
@@ -54,20 +69,36 @@ async def list_results(
             di sessione. È il filtro preferito per "i risultati di questa
             sessione": ``sessionItemIds`` resta disponibile ma è ambiguo quando
             uno stesso ``SessionItem`` è condiviso fra più sessioni.
+        client_id: valore di ``?clientId=``, filtra per motore di misura.
+        page: valore di ``?page=``, 1-based.
+        page_size: valore di ``?pageSize=``, limitato a
+            ``results_service.MAX_PAGE_SIZE``.
 
     Restituisce:
-        ``200`` con la lista dei risultati che soddisfano i filtri, ordinata per
-        istante di completamento crescente. I filtri si combinano in AND.
+        ``200`` con un ``ResultPage``: ``items`` (la pagina, ordinata per
+        istante di completamento crescente), ``total`` (quanti risultati
+        soddisfano i filtri **in tutto**, non solo in questa pagina), più
+        ``page`` e ``pageSize`` applicati. I filtri si combinano in AND.
+        ``page`` oltre l'ultima pagina disponibile produce ``items`` vuoto e
+        ``total`` invariato, non un errore.
 
     Fa:
         Spacchetta la lista comma-joined scartando i segmenti vuoti — così
         ``?sessionItemIds=a,,b`` e un parametro vuoto non generano filtri
-        spuri — e delega a ``results_service.list_results``.
+        spuri — e delega a ``results_service.list_results``, che restituisce
+        pagina e totale in un'unica chiamata. ``page``/``pageSize`` fuori range
+        sono respinti da FastAPI con ``422`` prima di arrivare al servizio.
     """
     ids = _split_ids(session_item_ids)
-    return await results_service.list_results(
-        scenario_path=scenario_path, session_item_ids=ids, session_id=session_id
+    items, total = await results_service.list_results(
+        scenario_path=scenario_path,
+        session_item_ids=ids,
+        session_id=session_id,
+        client_id=client_id,
+        page=page,
+        page_size=page_size,
     )
+    return ResultPage(items=items, total=total, page=page, pageSize=page_size)
 
 
 @router.get(

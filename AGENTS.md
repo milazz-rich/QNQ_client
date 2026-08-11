@@ -223,6 +223,7 @@ Esito di una singola ripetizione.
 | `sessionId`     | `str`                      | riferimento a `sessions`; la sessione che ha prodotto la misura |
 | `sessionItemId` | `str`                      | riferimento a `session_items`            |
 | `targetId`      | `str`                      | riferimento a `targets`; il target su cui è stata eseguita la misura |
+| `clientId`      | `str`                      | riferimento a `clients`; il motore che ha prodotto la misura |
 | `idx`           | `int`                      | ≥ 0, indice della ripetizione            |
 | `target`        | `str`                      | snapshot leggibile del target            |
 | `scenarioPath`  | `str`                      | snapshot del path richiesto              |
@@ -258,6 +259,21 @@ rinominato o cancellato. `targetId` è popolato da `measurement.runner` (per le
 misure reali, dal `Target` già risolto) e da `session_runner` (per i `Result`
 segnaposto degli item saltati, recuperandolo dal `SessionItem` di
 configurazione) — mai dal client HTTP.
+
+**`clientId`.** Stessa logica di `targetId`, applicata al motore di misura:
+riferimento esplicito a `clients._id`, popolato dagli stessi due punti e con lo
+stesso fallback sul `SessionItem`. Esiste perché il confronto **curl vs Chrome**
+(§5.6) è una dimensione di analisi di prima classe: senza questa FK andrebbe
+ricostruito risalendo `Result → SessionItem → Client`, con lo stesso rischio di
+matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
+`GET /api/results`.
+
+> **Nota di migrazione.** `targetId` e `clientId` sono **obbligatori**: i
+> `Result` scritti prima della loro introduzione non li avevano e la loro
+> validazione fallirebbe. Entrambe le volte i documenti esistenti sono stati
+> aggiornati con un backfill idempotente che ricava il valore dal `SessionItem`
+> referenziato. Se in futuro si aggiungesse un altro riferimento obbligatorio a
+> `Result`, va previsto lo stesso passaggio prima di rimettere in servizio l'API.
 
 ### 3.4 Pattern dei modelli Pydantic
 
@@ -622,10 +638,7 @@ no-op e il `404` è sollevato correttamente dal passo 2.
 > precedente run") usa lo stesso principio ma con filtro `sessionId`+`sessionItemId`,
 > per non cancellare i risultati di altre sessioni al rilancio.
 
-Sul versante lettura, `GET /api/results` accetta sia `?sessionId=` (filtro
-**preferito** per i risultati di una singola esecuzione, senza ambiguità) sia
-`?sessionItemIds=` (lista comma-separated, mantenuto per compatibilità); i filtri
-si combinano in AND con `?scenarioPath=`.
+Sul versante lettura vedi §5.7.
 
 ### 5.6 Motore di misura "chrome" (Playwright + CDP)
 
@@ -733,6 +746,63 @@ quindi **cosa** si sta misurando:
 Attenzione: con `load` su pagine molto pesanti il `timeout` del `SessionItem`
 deve essere generoso — è il tempo di caricamento dell'**intera pagina**, non
 della singola richiesta.
+
+### 5.7 Lettura dei risultati: filtri e paginazione
+
+`GET /api/results` è **l'unica rotta di elenco paginata**, perché è l'unica che
+può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
+`Result`, mentre target, scenari e client restano nell'ordine delle decine.
+
+#### Filtri (si combinano in AND)
+
+| Parametro | Significato |
+| --------- | ----------- |
+| `?sessionId=` | i risultati di **una** esecuzione. Filtro **preferito**: diretto e senza ambiguità |
+| `?sessionItemIds=` | lista comma-separated; mantenuto per compatibilità ma ambiguo (un `SessionItem` può essere condiviso fra sessioni, §3.3) |
+| `?clientId=` | il motore che ha prodotto la misura, per il confronto curl vs Chrome |
+| `?scenarioPath=` | confronto esatto sul path richiesto |
+
+#### Paginazione
+
+| Parametro | Default | Vincoli |
+| --------- | ------- | ------- |
+| `?page=` | `1` | ≥ 1, **1-based** |
+| `?pageSize=` | `50` | 1–200 (`results_service.MAX_PAGE_SIZE`) |
+
+Valori fuori range producono `422` da FastAPI, prima di toccare il database.
+Una `page` oltre l'ultima disponibile restituisce `items` vuoto con `total`
+invariato — non è un errore.
+
+#### Forma della risposta: envelope, non array
+
+Questa rotta rompe deliberatamente la convenzione delle altre (`list[Xxx]` nudo)
+e restituisce un **envelope**:
+
+```json
+{ "items": [ … ], "total": 1200, "page": 1, "pageSize": 50 }
+```
+
+* `total` è il numero di risultati che soddisfano i **filtri**, non quelli nella
+  pagina: senza, il frontend non potrebbe costruire i controlli di paginazione
+  se non scorrendo tutte le pagine.
+* `page`/`pageSize` sono riecheggiati per rendere la risposta autodescrittiva.
+
+L'envelope è stato preferito a un header `X-Total-Count` per due ragioni: gli
+header custom **non sono leggibili dal browser** senza aggiungere
+`expose_headers` alla configurazione CORS (una dipendenza nascosta e facile da
+rompere), e il progetto ha già un precedente di envelope dove serve davvero
+(`SessionItemBatchResult`). Il modello è `ResultPage` in `models/result.py`.
+
+L'ordinamento è per `time` crescente **con `_id` come discriminante secondario**:
+serve a rendere la paginazione stabile, perché misure diverse possono condividere
+lo stesso istante e senza un ordine totale pagine successive potrebbero ripetere
+o saltare documenti.
+
+> **Impatto sul frontend.** Sia la paginazione sia l'envelope sono cambiamenti
+> **incompatibili** con un client che si aspettava l'array completo: senza
+> `?pageSize=`, `GET /api/results` restituisce ora al massimo 50 elementi
+> dentro `items`. Il frontend va aggiornato a leggere `items`/`total` e a
+> paginare (o a passare `?pageSize=200` e iterare su `page`).
 
 ---
 

@@ -45,6 +45,15 @@ class ResultBase(MongoModel):
             "'target' (denormalizzato) resta invariato dopo una rinomina."
         ),
     )
+    client_id: MongoId = Field(
+        alias="clientId",
+        description=(
+            "Client (motore di misura) che ha prodotto il risultato. "
+            "Riferimento diretto per la stessa ragione di targetId: consente di "
+            "confrontare o filtrare le misure per motore (curl vs Chrome) senza "
+            "doverlo dedurre risalendo al SessionItem."
+        ),
+    )
     idx: int = Field(ge=0, description="Indice della ripetizione, a partire da 0")
     target: str = Field(min_length=1, max_length=300, description="Snapshot leggibile del target")
     scenario_path: str = Field(
@@ -96,3 +105,28 @@ class ResultCreate(ResultBase):
 
 class Result(ResultBase, MongoDocument):
     """Rappresentazione completa di un Result restituita dall'API."""
+
+
+class ResultPage(MongoModel):
+    """Pagina di risultati restituita da ``GET /api/results``.
+
+    È l'unica rotta di elenco che restituisce un *envelope* invece di un array
+    nudo: il conteggio totale non avrebbe altro posto dove stare, ed è
+    indispensabile al frontend per costruire i controlli di paginazione senza
+    dover interrogare l'API una seconda volta. La forma segue il precedente di
+    ``SessionItemBatchResult`` (envelope solo dove serve davvero).
+    """
+
+    items: list[Result] = Field(description="I risultati della pagina richiesta")
+    total: int = Field(
+        ge=0,
+        description=(
+            "Numero totale di risultati che soddisfano i filtri, "
+            "**non** il numero di elementi in questa pagina"
+        ),
+    )
+    page: int = Field(ge=1, description="Pagina restituita, 1-based")
+    page_size: int = Field(
+        ge=1, alias="pageSize", serialization_alias="pageSize",
+        description="Dimensione di pagina effettivamente applicata",
+    )

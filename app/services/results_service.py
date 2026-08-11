@@ -16,13 +16,22 @@ from app.models.result import Result, ResultCreate
 
 logger = logging.getLogger(__name__)
 
+# Paginazione di ``GET /api/results``. Il tetto massimo esiste perché una
+# sessione lunga produce facilmente migliaia di risultati: senza limite, una
+# singola richiesta potrebbe caricarli tutti in memoria e saturare la risposta.
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+
 
 async def list_results(
     scenario_path: str | None = None,
     session_item_ids: list[str] | None = None,
     session_id: str | None = None,
-) -> list[Result]:
-    """Elenca i risultati, opzionalmente filtrati.
+    client_id: str | None = None,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> tuple[list[Result], int]:
+    """Elenca una pagina di risultati, opzionalmente filtrati.
 
     Riceve:
         scenario_path: se valorizzato, restituisce solo i risultati di quello
@@ -34,16 +43,26 @@ async def list_results(
             "i risultati di questa sessione": diretto e senza l'ambiguità di
             ``session_item_ids``, dato che uno stesso ``SessionItem`` può essere
             condiviso fra più sessioni.
+        client_id: se valorizzato, restituisce solo i risultati prodotti da quel
+            motore di misura (confronto curl vs Chrome).
+        page: pagina richiesta, 1-based.
+        page_size: numero massimo di risultati per pagina.
 
     Restituisce:
-        La lista dei ``Result`` che soddisfano i filtri, ordinata per istante di
-        completamento crescente.
+        La coppia ``(risultati della pagina, totale che soddisfa i filtri)``.
+        Il totale è **indipendente dalla paginazione**: serve al chiamante per
+        sapere quante pagine esistono senza doverle scorrere tutte.
 
     Fa:
-        Compone la query Mongo combinando i filtri in AND. Gli id sono
+        Compone la query Mongo combinando i filtri in AND, poi esegue due
+        operazioni sulla stessa query: un ``count_documents`` per il totale e
+        una ``find`` con ``skip``/``limit`` per la pagina. Gli id sono
         confrontati come stringhe, coerentemente con come il runner li salva.
         Una lista di id vuota è trattata come "nessun filtro", non come "nessun
-        risultato", perché deriva da una query string vuota.
+        risultato", perché deriva da una query string vuota. L'ordinamento per
+        ``time`` crescente è ciò che rende la paginazione stabile: senza un
+        ordine totale, pagine successive potrebbero ripetere o saltare
+        documenti.
     """
     query: dict[str, object] = {}
     if scenario_path:
@@ -52,13 +71,23 @@ async def list_results(
         query["sessionItemId"] = {"$in": session_item_ids}
     if session_id:
         query["sessionId"] = session_id
+    if client_id:
+        query["clientId"] = client_id
 
     collection = get_collection(RESULTS)
+    skip = (page - 1) * page_size
     try:
-        documents = await collection.find(query).sort("time", 1).to_list(length=None)
+        total = await collection.count_documents(query)
+        documents = (
+            await collection.find(query)
+            .sort([("time", 1), ("_id", 1)])
+            .skip(skip)
+            .limit(page_size)
+            .to_list(length=page_size)
+        )
     except PyMongoError as exc:
         raise DatabaseError("Impossibile leggere i risultati dal database.") from exc
-    return [Result.model_validate(document) for document in documents]
+    return [Result.model_validate(document) for document in documents], total
 
 
 async def get_result(result_id: str) -> Result:

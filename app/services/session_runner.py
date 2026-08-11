@@ -139,13 +139,13 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
         ``None``.
 
     Fa:
-        ``targetId`` è un riferimento obbligatorio in ``Result``: per
-        valorizzarlo occorre recuperare il ``SessionItem`` di configurazione
+        ``targetId`` e ``clientId`` sono riferimenti obbligatori in ``Result``:
+        per valorizzarli occorre recuperare il ``SessionItem`` di configurazione
         (l'errore che ha fatto saltare l'item può derivare dalla risoluzione
-        di Target/Scenario/Client, ma il ``SessionItem`` stesso — e quindi il
-        suo ``targetId`` — è di solito ancora leggibile). Se anche il
+        di Target/Scenario/Client, ma il ``SessionItem`` stesso — e quindi i
+        riferimenti che contiene — è di solito ancora leggibile). Se anche il
         ``SessionItem`` non esiste più (cancellato dopo essere stato
-        referenziato da questa sessione), non c'è alcun target a cui legare
+        referenziato da questa sessione), non ci sono riferimenti a cui legare
         il risultato: il fallimento resta comunque nei log applicativi, ma
         nessun ``Result`` viene creato per questo item.
     """
@@ -154,7 +154,7 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
     except AppError:
         logger.warning(
             "Nessun Result creato per l'item %d della sessione %s: "
-            "SessionItem '%s' non più risolvibile (targetId sconosciuto).",
+            "SessionItem '%s' non più risolvibile (targetId/clientId sconosciuti).",
             item.done,
             session_id,
             item.session_item_id,
@@ -165,6 +165,7 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
         sessionId=session_id,
         sessionItemId=item.session_item_id,
         targetId=session_item.target_id,
+        clientId=session_item.client_id,
         idx=item.done,
         target=item.label,
         scenarioPath=f"(non eseguito: {reason})",
