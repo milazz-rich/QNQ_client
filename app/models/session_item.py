@@ -2,8 +2,12 @@
 
 Un ``SessionItem`` descrive **una variante da misurare** all'interno di una
 sessione: quale scenario, con quale protocollo, su quale ambiente. *Chi*
-misura (il client) e *cosa* si misura (il motore) non stanno più qui: sono
-scelte della ``Session``, uguali per tutti i suoi item (vedi AGENTS.md §3.3).
+misura (il client), *cosa* si misura (il motore) e *quanto* misurarlo (numero
+di ripetizioni, timeout) non stanno più qui: sono scelte della ``Session``,
+uguali per tutti i suoi item (vedi AGENTS.md §3.3). ``reps`` e ``timeout`` in
+particolare sono impostati una volta sola nello step di configurazione del
+wizard e non variano fra le combinazioni Scenario × Protocollo × Ambiente
+generate dal batch — non avrebbe senso duplicarli su ogni item.
 
 Protocollo e ambiente sono **parametri della misura**, non attributi del
 server: lo stesso motore, sullo stesso endpoint, può essere interrogato in
@@ -27,8 +31,6 @@ class SessionItemBase(MongoModel):
             "sessione (``target.endpoints[environment]``)"
         )
     )
-    reps: int = Field(ge=1, description="Numero di ripetizioni della misura")
-    timeout: int = Field(ge=1, description="Timeout della singola richiesta in millisecondi")
 
 
 class SessionItemCreate(SessionItemBase):
@@ -41,8 +43,6 @@ class SessionItemUpdate(MongoModel):
     scenario_id: MongoId | None = Field(default=None, alias="scenarioId")
     protocol: Protocol | None = None
     environment: Environment | None = None
-    reps: int | None = Field(default=None, ge=1)
-    timeout: int | None = Field(default=None, ge=1)
 
 
 class SessionItem(SessionItemBase, MongoDocument):
@@ -58,7 +58,9 @@ class SessionItemBatchCreate(MongoModel):
     ``session_items_service.create_session_items_batch``).
 
     Target e client non compaiono qui proprio perché non sono più dell'item:
-    vengono impostati sulla ``Session`` che raccoglierà questi item.
+    vengono impostati sulla ``Session`` che raccoglierà questi item. Lo stesso
+    vale per ``reps`` e ``timeout``: sono uguali per l'intera batch, quindi
+    vivono sulla ``Session`` e non su ogni combinazione generata qui.
     """
 
     scenario_ids: list[MongoId] = Field(
@@ -70,8 +72,6 @@ class SessionItemBatchCreate(MongoModel):
     environments: list[Environment] = Field(
         min_length=1, description="Ambienti da testare su ogni combinazione"
     )
-    reps: int = Field(ge=1, description="Ripetizioni, uguali per ogni item generato")
-    timeout: int = Field(ge=1, description="Timeout in ms, uguale per ogni item generato")
 
 
 class SessionItemBatchResult(MongoModel):

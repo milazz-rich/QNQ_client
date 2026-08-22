@@ -189,7 +189,7 @@ class ResultAggregateGroup(MongoModel):
     key: str = Field(
         description=(
             "Valore della dimensione: l'id dell'entità per target/client/"
-            "scenario, il tag stesso per groupBy=tag"
+            "scenario, il valore dell'enum per groupBy=environment"
         )
     )
     label: str = Field(description="Etichetta leggibile del gruppo")

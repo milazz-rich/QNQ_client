@@ -5,8 +5,8 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
-from app.core.errors import DatabaseError, NotFoundError, ValidationError
-from app.db.collections import SESSION_ITEMS
+from app.core.errors import ConflictError, DatabaseError, NotFoundError, ValidationError
+from app.db.collections import SESSION_ITEMS, SESSIONS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
 from app.models.session_item import (
@@ -94,7 +94,7 @@ async def create_session_items_batch(spec: SessionItemBatchCreate) -> list[str]:
 
     Riceve:
         spec: la specifica del wizard — quali scenari, quali protocolli, quali
-            ambienti, più i parametri comuni (reps, timeout).
+            ambienti.
 
     Restituisce:
         La lista degli ``id`` (stringa) assegnati da MongoDB, nell'ordine di
@@ -104,9 +104,9 @@ async def create_session_items_batch(spec: SessionItemBatchCreate) -> list[str]:
         Costruisce il prodotto cartesiano **nel backend**: il wizard invia una
         specifica compatta invece di N×M×P oggetti già espansi.
 
-        Target e client **non** compaiono nel prodotto: sono scelte della
-        ``Session`` che raccoglierà questi item, uguali per tutti (§3.3 di
-        AGENTS.md). Ciò che varia da item a item è solo la terna
+        Target, client, ``reps`` e ``timeout`` **non** compaiono nel prodotto:
+        sono scelte della ``Session`` che raccoglierà questi item, uguali per
+        tutti (§3.3 di AGENTS.md). Ciò che varia da item a item è solo la terna
         *(scenario, protocollo, ambiente)* — le tre dimensioni del confronto.
 
         I tre insiemi sono **deduplicati** preservando l'ordine di
@@ -130,8 +130,6 @@ async def create_session_items_batch(spec: SessionItemBatchCreate) -> list[str]:
             scenarioId=scenario_id,
             protocol=protocol,
             environment=environment,
-            reps=spec.reps,
-            timeout=spec.timeout,
         )
         for scenario_id in scenario_ids
         for protocol in protocols
@@ -191,7 +189,7 @@ async def update_session_item(session_item_id: str, payload: SessionItemUpdate) 
 
 
 async def delete_session_item(session_item_id: str) -> None:
-    """Elimina un session item.
+    """Elimina un session item, se non più referenziato da alcuna sessione.
 
     Riceve:
         session_item_id: identificativo del session item da eliminare.
@@ -200,12 +198,30 @@ async def delete_session_item(session_item_id: str) -> None:
         ``None``.
 
     Fa:
-        Cancella il documento dalla collezione ``session_items`` e solleva
-        ``NotFoundError`` se non esisteva, così che il client distingua una
-        cancellazione effettiva da un id sbagliato.
+        Verifica prima che nessuna ``Session`` referenzi ancora questo
+        ``SessionItem`` nel proprio array ``items`` (campo
+        ``items.sessionItemId``, confrontato come stringa): se ne trova almeno
+        una solleva ``ConflictError`` e non procede alla cancellazione, per non
+        lasciare una sessione con un riferimento pendente. Solo se nessuna
+        sessione lo referenzia cancella il documento dalla collezione
+        ``session_items``, sollevando ``NotFoundError`` se non esisteva, così
+        che il client distingua una cancellazione effettiva da un id sbagliato.
     """
     collection = get_collection(SESSION_ITEMS)
+    sessions_collection = get_collection(SESSIONS)
     object_id = to_object_id(session_item_id, "Id del session item")
+    try:
+        referencing_session = await sessions_collection.find_one(
+            {"items": {"$elemMatch": {"sessionItemId": session_item_id}}}
+        )
+    except PyMongoError as exc:
+        raise DatabaseError(
+            "Impossibile verificare i riferimenti al session item."
+        ) from exc
+    if referencing_session is not None:
+        raise ConflictError(
+            f"SessionItem '{session_item_id}' è ancora in uso da una o più sessioni."
+        )
     try:
         delete_result = await collection.delete_one({"_id": object_id})
     except PyMongoError as exc:

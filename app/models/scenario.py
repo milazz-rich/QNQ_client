@@ -16,7 +16,6 @@ class ScenarioBase(MongoModel):
         description="Path della richiesta, deve iniziare con '/'",
     )
     desc: str = Field(default="", max_length=500, description="Descrizione estesa")
-    tag: str = Field(default="", max_length=40, description="Etichetta breve di categoria")
 
 
 class ScenarioCreate(ScenarioBase):
@@ -29,7 +28,6 @@ class ScenarioUpdate(MongoModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     path: str | None = Field(default=None, min_length=1, max_length=2048, pattern=r"^/")
     desc: str | None = Field(default=None, max_length=500)
-    tag: str | None = Field(default=None, max_length=40)
 
 
 class Scenario(ScenarioBase, MongoDocument):

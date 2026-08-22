@@ -189,7 +189,14 @@ Percorso/payload da richiedere al target.
 | `name` | `str` | 1–120 char                     |
 | `path` | `str` | deve iniziare con `/`          |
 | `desc` | `str` | descrizione, ≤ 500 char        |
-| `tag`  | `str` | etichetta breve, ≤ 40 char     |
+
+`Scenario` **non ha un campo `tag`**: era un'etichetta libera senza un uso
+strutturale (non filtrava, non aggregava — a differenza di `environment`, che
+quel ruolo lo ricopre davvero, vedi §5.8), quindi è stata rimossa dallo schema
+invece di restare come metadato morto. I documenti `scenarios` preesistenti
+sono stati aggiornati con un `$unset` idempotente, per lo stesso motivo di
+`extra="forbid"` visto altrove (§3.4): un campo fuori schema nei documenti
+esistenti farebbe fallire la validazione in lettura.
 
 #### Client — collezione `clients`
 
@@ -211,17 +218,26 @@ Una **variante da misurare** dentro una sessione: "*questo* scenario, con
 | `scenarioId`  | `str`                  | riferimento a `scenarios._id`    |
 | `protocol`    | `"HTTP/2" \| "HTTP/3"` | enum, **obbligatorio**           |
 | `environment` | `"docker" \| "kvm"`    | enum, **obbligatorio**; seleziona l'endpoint del target |
-| `reps`        | `int`                  | ≥ 1, numero di ripetizioni       |
-| `timeout`     | `int`                  | ms, ≥ 1                          |
 
-**Non ha `targetId` né `clientId`**: sono della `Session` che lo esegue, uguali
-per tutti i suoi item. Qui resta solo ciò che *varia* fra un item e l'altro —
-la terna *(scenario, protocollo, ambiente)*, cioè le tre dimensioni del
-confronto.
+**Non ha `targetId`, `clientId`, `reps` né `timeout`**: sono della `Session`
+che lo esegue, uguali per tutti i suoi item. Qui resta solo ciò che *varia* fra
+un item e l'altro — la terna *(scenario, protocollo, ambiente)*, cioè le tre
+dimensioni del confronto. `reps` e `timeout` in particolare sono impostati una
+volta sola nello step di configurazione del wizard: non ha senso ripeterli
+identici su ogni combinazione generata dal batch (§3.5).
 
 È il `SessionItem` — non il `Target` — a decidere protocollo e ambiente: è lui
 la fonte di verità che `measurement.runner` legge per scegliere il flag di curl
 o di Chrome **e** per risolvere l'endpoint da interrogare (§3.6).
+
+**Vincolo di integrità referenziale.** `DELETE /api/session-items/{id}` rifiuta
+(`409 CONFLICT`) la cancellazione di un `SessionItem` se almeno una `Session`
+lo referenzia ancora nel proprio array `items` (`items.sessionItemId`,
+verificato con `$elemMatch` prima del `delete_one`). Un `SessionItem` è quindi
+eliminabile solo se non appartiene a nessuna sessione esistente — il che rende
+strutturalmente impossibile il caso di un `Result` segnaposto che debba
+recuperare `targetId`/`scenarioId`/`environment` da un `SessionItem` già
+cancellato (§5.4).
 
 #### Session — collezione `sessions`
 
@@ -234,6 +250,8 @@ client**, declinato su più scenari, protocolli e ambienti.
 | `name`         | `str`                                    | 1–120 char                          |
 | `targetId`     | `str`                                    | riferimento a `targets._id`; il motore sotto test |
 | `clientId`     | `str`                                    | riferimento a `clients._id`; il motore di misura |
+| `reps`         | `int`                                    | ≥ 1, ripetizioni per item, uguali per tutta la sessione |
+| `timeout`      | `int`                                    | ms, ≥ 1, uguale per tutta la sessione |
 | `when`         | `datetime`                               | UTC, ISO-8601                       |
 | `status`       | `"pending"\|"running"\|"completed"\|"failed"` | default `pending`; `failed` se almeno un item termina `failed` |
 | `currentIndex` | `int`                                    | ≥ 0, indice dell'item in esecuzione |
@@ -351,8 +369,11 @@ Il principio che risolve tutto: **né il protocollo né l'ambiente sono attribut
 del server**. Sono *parametri della misura*. Lo stesso motore, sullo stesso
 codice, può essere interrogato in HTTP/2 o HTTP/3, e può girare in container o
 su VM — ed è esattamente ciò che l'applicazione esiste per confrontare.
-Stanno quindi su `SessionItem`, accanto agli altri parametri (`reps`,
-`timeout`).
+Stanno quindi su `SessionItem`, che rappresenta la singola variante — a
+differenza di `reps` e `timeout`, che pur essendo anch'essi "parametri della
+misura" non variano *fra* le combinazioni della stessa sessione, e per questo
+sono risaliti sulla `Session` (dettaglio consolidato in una seconda passata,
+vedi sotto).
 
 Il modello che ne risulta:
 
@@ -373,7 +394,11 @@ Conseguenze:
   misurato da un client, e ripeterli su ogni item sarebbe stata duplicazione
   pura (oltre che un invito all'incoerenza).
 * **`SessionItem`** perde `targetId`/`clientId` e guadagna `environment`.
-  Resta solo ciò che varia fra un item e l'altro.
+  Resta solo ciò che varia fra un item e l'altro — e in una seconda passata di
+  consolidamento gli sono stati tolti anche `reps` e `timeout` (risaliti sulla
+  `Session`, vedi il paragrafo sopra e il dettaglio più sotto): non variavano
+  comunque fra le combinazioni di una stessa sessione, quindi ripeterli su ogni
+  item era la stessa duplicazione già corretta per target e client.
 * **`Result`** guadagna `environment`, allo stesso titolo di
   `targetId`/`clientId`/`scenarioId`: è la dimensione del confronto
   containerizzato vs virtualizzato, e averla sul risultato evita di risalire al
@@ -424,23 +449,21 @@ cartesiano lo costruisce il backend.
 {
   "scenarioIds":  ["…", "…", "…"],
   "protocols":    ["HTTP/2", "HTTP/3"],
-  "environments": ["docker", "kvm"],
-  "reps":         20,
-  "timeout":      10000
+  "environments": ["docker", "kvm"]
 }
 ```
 
 Genera **Scenario × Protocollo × Ambiente** — nell'esempio 3 × 2 × 2 = 12
-`SessionItem`, tutti con gli stessi `reps` e `timeout`. Risponde `201` con
-`{"ids": [...]}` in ordine deterministico: scenario esterno, poi protocollo,
-poi ambiente, così il chiamante può correlare gli id alle combinazioni
-richieste senza rileggerli.
+`SessionItem`. Risponde `201` con `{"ids": [...]}` in ordine deterministico:
+scenario esterno, poi protocollo, poi ambiente, così il chiamante può
+correlare gli id alle combinazioni richieste senza rileggerli.
 
 Dettagli non ovvi:
 
-* **Target e client non compaiono** nella specifica: sono scelte della
-  `Session` che raccoglierà questi item (§3.3), uguali per tutti. Il wizard li
-  seleziona una volta sola, all'inizio.
+* **Target, client, `reps` e `timeout` non compaiono** nella specifica: sono
+  scelte della `Session` che raccoglierà questi item (§3.3), uguali per tutti.
+  Il wizard li imposta una volta sola nello step di configurazione, non per
+  ogni combinazione generata qui.
 * **`protocols` ed `environments` sono assi espliciti** per effetto del
   refactoring (§3.3): finché protocollo e ambiente stavano sul `Target`, il
   prodotto era Target × Scenario e le due dimensioni erano implicite nella
@@ -456,8 +479,9 @@ Dettagli non ovvi:
   un errore che il runner intercetta comunque.
 
 > **Cambiamento incompatibile.** Il frontend va aggiornato: il wizard deve ora
-> scegliere target e client **per la sessione**, e scenari/protocolli/ambienti
-> come selezioni multiple per il prodotto.
+> scegliere target, client, `reps` e `timeout` **una volta per l'intera
+> sessione** (inclusi in `POST /api/sessions`, non nel batch), e
+> scenari/protocolli/ambienti come selezioni multiple per il prodotto.
 
 ### 3.6 Risoluzione dell'endpoint in fase di misura
 
@@ -666,7 +690,7 @@ POST /api/sessions/{id}/start
   → status = running, risposta 202 immediata
   → BackgroundTask: session_runner.start_session
       per ogni item (in SEQUENZA):
-        currentIndex = i, item.status = running, item.total = SessionItem.reps
+        currentIndex = i, item.status = running, item.total = Session.reps
         risolve Target / Scenario / Client   (measurement.runner.resolve_context)
         cancella i Result di una precedente run DI QUESTA sessione (sessionId+item)
         per ogni ripetizione:
@@ -839,12 +863,10 @@ viene comunque salvato un `Result` con `status="failed"`, tempi a zero e
 campi denormalizzati abituali (`target`/`scenarioPath`) che qui non sono
 disponibili — così il fallimento resta tracciato invece di sparire
 silenziosamente. `targetId` (obbligatorio in `Result`) viene recuperato da
-`session_runner` rileggendo il `SessionItem` di configurazione. **Unico caso
-limite**: se anche il `SessionItem` referenziato non esiste più (cancellato
-dopo essere stato incluso in questa sessione), non c'è alcun `targetId` da cui
-costruire un `Result` valido; in quel caso specifico l'item viene comunque
-marcato `failed` e l'errore resta nei log applicativi, ma **nessun `Result`**
-viene creato per quell'item.
+`session_runner` rileggendo il `SessionItem` di configurazione — rilettura che
+non fallisce mai per id inesistente, perché `DELETE /api/session-items/{id}`
+rifiuta la cancellazione di un `SessionItem` ancora referenziato da una
+`Session` (§3.3).
 
 In sintesi, un item termina `failed` in due casi distinti — mai eseguito
 (configurazione rotta) oppure eseguito ma senza successo (una o più
@@ -1034,7 +1056,7 @@ quindi **cosa** si sta misurando:
   e utile per un confronto diretto fra i due client, ma rinunciano proprio a ciò
   che il browser aggiunge.
 
-Attenzione: con `load` su pagine molto pesanti il `timeout` del `SessionItem`
+Attenzione: con `load` su pagine molto pesanti il `timeout` della `Session`
 deve essere generoso — è il tempo di caricamento dell'**intera pagina**, non
 della singola richiesta.
 

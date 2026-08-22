@@ -106,9 +106,9 @@ async def create_session_items_batch(
 
     Riceve:
         payload: la **specifica** — ``scenarioIds``, ``protocols``,
-            ``environments`` più i parametri comuni (``reps``, ``timeout``).
-            Non una lista di item già espansa: è il backend a costruire il
-            prodotto. Target e client non compaiono: sono della ``Session``.
+            ``environments``. Non una lista di item già espansa: è il backend a
+            costruire il prodotto. Target, client, ``reps`` e ``timeout`` non
+            compaiono: sono della ``Session`` che raccoglierà questi item.
 
     Restituisce:
         ``201`` con gli ``id`` creati, in ordine deterministico (scenario
@@ -155,7 +155,13 @@ async def update_session_item(
     "/{session_item_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Elimina un session item",
-    responses={404: {"model": ErrorResponse, "description": "SessionItem inesistente"}},
+    responses={
+        404: {"model": ErrorResponse, "description": "SessionItem inesistente"},
+        409: {
+            "model": ErrorResponse,
+            "description": "SessionItem ancora referenziato da una o più sessioni",
+        },
+    },
 )
 async def delete_session_item(session_item_id: str = _SessionItemId) -> None:
     """Elimina un session item.
@@ -168,6 +174,8 @@ async def delete_session_item(session_item_id: str = _SessionItemId) -> None:
 
     Fa:
         Delega a ``session_items_service.delete_session_item``; se il session
-        item non esisteva risponde ``404 NOT_FOUND`` invece di fingere un successo.
+        item non esisteva risponde ``404 NOT_FOUND`` invece di fingere un
+        successo, e se è ancora referenziato da una o più sessioni risponde
+        ``409 CONFLICT`` senza procedere alla cancellazione.
     """
     await session_items_service.delete_session_item(session_item_id)

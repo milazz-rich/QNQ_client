@@ -50,7 +50,9 @@ class MeasurementContext:
 
     Attributi:
         session_item: la configurazione della misura (scenario, protocollo,
-            ambiente, ripetizioni, timeout).
+            ambiente). Ripetizioni e timeout non sono più qui: vivono sulla
+            ``Session`` (§3.3 di AGENTS.md) e arrivano a ``measure_once`` come
+            parametro esplicito, non tramite questo contesto.
         target: il motore sotto test, con tutti i suoi endpoint.
         endpoint: l'endpoint effettivamente interrogato, già risolto
             dall'ambiente dell'item.
@@ -150,7 +152,9 @@ async def resolve_context(
     )
 
 
-async def measure_once(context: MeasurementContext, idx: int, session_id: str) -> ResultCreate:
+async def measure_once(
+    context: MeasurementContext, idx: int, session_id: str, timeout_ms: int
+) -> ResultCreate:
     """Esegue una singola ripetizione e ne costruisce il risultato.
 
     Riceve:
@@ -159,6 +163,9 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
         session_id: identificativo della sessione che sta eseguendo la misura,
             salvato in ``Result.sessionId`` per legare il risultato alla singola
             esecuzione (il ``SessionItem`` può essere condiviso fra sessioni).
+        timeout_ms: timeout della richiesta in millisecondi, **dalla Session**
+            (§3.3 di AGENTS.md): non è più un campo del ``SessionItem``, quindi
+            il chiamante lo passa esplicito invece di leggerlo dal contesto.
 
     Restituisce:
         Un ``ResultCreate`` pronto per essere salvato, con ``status`` pari a
@@ -188,7 +195,7 @@ async def measure_once(context: MeasurementContext, idx: int, session_id: str) -
     measurement = await context.backend.measure(
         url=context.url,
         protocol=item.protocol,
-        timeout_ms=item.timeout,
+        timeout_ms=timeout_ms,
     )
 
     if not measurement.succeeded:

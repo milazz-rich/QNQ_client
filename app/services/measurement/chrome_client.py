@@ -200,7 +200,7 @@ async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement:
     Riceve:
         url: l'URL da richiedere.
         protocol: il protocollo da imporre al browser.
-        timeout_ms: timeout di navigazione in millisecondi, dal ``SessionItem``.
+        timeout_ms: timeout di navigazione in millisecondi, dalla ``Session``.
 
     Restituisce:
         Un ``Measurement``: mai un'eccezione per un fallimento di rete o di

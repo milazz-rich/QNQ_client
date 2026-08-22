@@ -149,22 +149,13 @@ async def _save_skipped_item_result(
         ``targetId`` e ``clientId`` sono sempre disponibili (li porta la
         ``Session``), mentre ``scenarioId`` ed ``environment`` — anch'essi
         obbligatori in ``Result`` — vivono sul ``SessionItem`` e vanno
-        riletti. Se il ``SessionItem`` non esiste più (cancellato dopo essere
-        stato referenziato da questa sessione) quei due valori non sono
-        ricostruibili: il fallimento resta nei log applicativi, ma nessun
-        ``Result`` viene creato per questo item.
+        riletti. Il ``SessionItem`` non può essere stato cancellato nel
+        frattempo: ``session_items_service.delete_session_item`` rifiuta la
+        cancellazione (``ConflictError``) finché una ``Session`` lo referenzia
+        ancora nel proprio ``items``, quindi la rilettura qui non fallisce mai
+        per un id inesistente.
     """
-    try:
-        session_item = await session_items_service.get_session_item(item.session_item_id)
-    except AppError:
-        logger.warning(
-            "Nessun Result creato per l'item %d della sessione %s: "
-            "SessionItem '%s' non più risolvibile (scenarioId/environment sconosciuti).",
-            item.done,
-            session.id,
-            item.session_item_id,
-        )
-        return
+    session_item = await session_items_service.get_session_item(item.session_item_id)
 
     result = ResultCreate(
         sessionId=session.id,
@@ -217,17 +208,21 @@ async def _run_single_item(session: Session, index: int, item: SessionProgressIt
         sessione** per questo item — scoping per ``(sessionId, sessionItemId)``,
         non per solo ``sessionItemId``: il ``SessionItem`` può essere condiviso
         da altre sessioni, i cui risultati non vanno toccati — e poi esegue
-        ``reps`` misurazioni. Dopo ogni ripetizione salva il ``Result``,
-        incrementa ``done`` sul database (così che il polling del frontend veda
-        l'avanzamento progredire) e attende ``settings.measurement_delay_ms``
-        prima della ripetizione successiva — sempre, riuscita o fallita che sia
-        la misura appena fatta, per qualunque client/target/protocollo: la
-        pausa mitiga il rate limiter sulle nuove connessioni osservato su
-        OpenLiteSpeed (§5.3 di AGENTS.md), ma è deliberatamente uniforme e non
-        condizionata al caso specifico, per non introdurre una variabile in più
-        fra i dati raccolti su target diversi. Il campo ``total`` è riallineato
-        a ``reps`` prima di partire, perché è il ``SessionItem`` la fonte di
-        verità sul numero di ripetizioni.
+        ``session.reps`` misurazioni, ciascuna con timeout ``session.timeout``:
+        entrambi vivono sulla ``Session``, non sul ``SessionItem`` (§3.3 di
+        AGENTS.md), perché sono uguali per ogni combinazione Scenario ×
+        Protocollo × Ambiente della stessa sessione. Dopo ogni ripetizione
+        salva il ``Result``, incrementa ``done`` sul database (così che il
+        polling del frontend veda l'avanzamento progredire) e attende
+        ``settings.measurement_delay_ms`` prima della ripetizione successiva —
+        sempre, riuscita o fallita che sia la misura appena fatta, per
+        qualunque client/target/protocollo: la pausa mitiga il rate limiter
+        sulle nuove connessioni osservato su OpenLiteSpeed (§5.3 di AGENTS.md),
+        ma è deliberatamente uniforme e non condizionata al caso specifico, per
+        non introdurre una variabile in più fra i dati raccolti su target
+        diversi. Il campo ``total`` è riallineato a ``session.reps`` prima di
+        partire, perché è la ``Session`` la fonte di verità sul numero di
+        ripetizioni.
     """
     session_item = await session_items_service.get_session_item(item.session_item_id)
     context = await measurement_runner.resolve_context(
@@ -236,21 +231,23 @@ async def _run_single_item(session: Session, index: int, item: SessionProgressIt
 
     await results_service.delete_results_by_session_and_item(session.id, session_item.id)
     await sessions_service.update_item_progress(
-        session.id, index, total=session_item.reps, done=0
+        session.id, index, total=session.reps, done=0
     )
 
     logger.info(
         "Item %d: %d ripetizioni %s su %s [%s]",
         index,
-        session_item.reps,
+        session.reps,
         session_item.protocol.value,
         context.url,
         session_item.environment.value,
     )
 
     any_rep_failed = False
-    for idx in range(session_item.reps):
-        result = await measurement_runner.measure_once(context, idx, session.id)
+    for idx in range(session.reps):
+        result = await measurement_runner.measure_once(
+            context, idx, session.id, timeout_ms=session.timeout
+        )
         await results_service.create_result(result)
         if result.status is ResultStatus.FAILED:
             any_rep_failed = True

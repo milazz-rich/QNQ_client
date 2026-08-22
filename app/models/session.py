@@ -65,6 +65,10 @@ class SessionBase(MongoModel):
     Una sessione è **un motore misurato da un client**, declinato su più
     scenari, protocolli e ambienti: ``targetId`` e ``clientId`` sono quindi
     suoi, non dei singoli ``SessionItem``, che li ereditano tutti uguali.
+    Anche ``reps`` e ``timeout`` sono qui e non sul ``SessionItem``, per lo
+    stesso motivo: sono impostati una volta sola nello step di configurazione
+    del wizard e restano gli stessi per ogni combinazione Scenario × Protocollo
+    × Ambiente generata dal batch.
     """
 
     name: str = Field(min_length=1, max_length=120, description="Nome leggibile della sessione")
@@ -73,6 +77,10 @@ class SessionBase(MongoModel):
     )
     client_id: MongoId = Field(
         alias="clientId", description="Client che esegue le misure, uguale per tutti gli item"
+    )
+    reps: int = Field(ge=1, description="Ripetizioni per item, uguali per tutta la sessione")
+    timeout: int = Field(
+        ge=1, description="Timeout della singola richiesta in millisecondi, uguale per tutta la sessione"
     )
     when: datetime = Field(description="Istante di pianificazione o avvio, in UTC")
     status: RunStatus = Field(default=RunStatus.PENDING, description="Stato della sessione")
@@ -94,6 +102,8 @@ class SessionUpdate(MongoModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     target_id: MongoId | None = Field(default=None, alias="targetId")
     client_id: MongoId | None = Field(default=None, alias="clientId")
+    reps: int | None = Field(default=None, ge=1)
+    timeout: int | None = Field(default=None, ge=1)
     when: datetime | None = None
     status: RunStatus | None = None
     current_index: int | None = Field(default=None, alias="currentIndex", ge=0)

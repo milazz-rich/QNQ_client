@@ -311,7 +311,7 @@ async def measure(
     Riceve:
         url: l'URL da richiedere.
         protocol: il protocollo da forzare (``--http2`` o ``--http3``).
-        timeout_ms: timeout della richiesta in millisecondi, dal ``SessionItem``.
+        timeout_ms: timeout della richiesta in millisecondi, dalla ``Session``.
 
     Restituisce:
         Un ``Measurement``: mai un'eccezione per un fallimento di rete, così
