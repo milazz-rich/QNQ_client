@@ -40,7 +40,7 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
     │   ├── cors.py            # configurazione CORS
     │   └── errors.py          # eccezioni applicative + exception handlers
     ├── db/
-    │   ├── mongo.py           # ciclo di vita della connessione motor
+    │   ├── mongo.py           # ciclo di vita della connessione motor + indici
     │   └── collections.py     # nomi delle collezioni (costanti)
     ├── models/                # Pydantic models, un file per entità + barrel
     │   ├── __init__.py        # barrel: riesporta tutti i modelli
@@ -104,8 +104,9 @@ routers/  →  services/  →  db/
 Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
 `POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
-lettura filtrata di `results`, il session runner in background e **due motori
-di misura**: `curl` (§5.2) e `chrome` (§5.6).
+lettura filtrata e paginata di `results` (§5.7) con endpoint di aggregazione
+(§5.8), il session runner in background e **due motori di misura**: `curl`
+(§5.2) e `chrome` (§5.6).
 
 Non ancora implementato: client diversi da `curl` e `chrome` (es. Firefox), che
 sollevano `NOT_IMPLEMENTED`; interruzione di una sessione già avviata.
@@ -143,17 +144,40 @@ MongoDB usa `_id` di tipo `ObjectId`. L'API espone sempre **`id` come stringa**.
 
 #### Target — collezione `targets`
 
-Server sotto test.
+Il **motore web** sotto test (Caddy, nginx, OpenLiteSpeed), con i suoi indirizzi
+in ciascun ambiente di deploy.
 
-| Campo      | Tipo                     | Vincoli                                       |
-| ---------- | ------------------------ | --------------------------------------------- |
-| `id`       | `str`                    | da `_id`, read-only                           |
-| `name`     | `str`                    | 1–120 char, non vuoto                         |
-| `host`     | `str`                    | 1–255 char, hostname o IP, senza schema `://` |
-| `port`     | `int`                    | 1–65535                                       |
-| `protocol` | `"HTTP/2" \| "HTTP/3"`   | enum                                          |
-| `status`   | `"online"\|"idle"\|"offline"` | enum, default `offline`                  |
-| `tag`      | `str`                    | etichetta breve, ≤ 40 char, default `""`      |
+| Campo       | Tipo                                  | Vincoli                     |
+| ----------- | ------------------------------------- | --------------------------- |
+| `id`        | `str`                                 | da `_id`, read-only         |
+| `name`      | `str`                                 | 1–120 char, nome del motore |
+| `endpoints` | `{ "docker": Endpoint, "kvm": Endpoint }` | dizionario a chiavi chiuse (`Environment`) |
+
+`Endpoint` (documento embedded, uno per ambiente):
+
+| Campo    | Tipo                          | Vincoli                                       |
+| -------- | ----------------------------- | --------------------------------------------- |
+| `host`   | `str`                         | 1–255 char, hostname o IP, senza schema `://` |
+| `port`   | `int`                         | 1–65535                                       |
+| `status` | `"online"\|"idle"\|"offline"` | enum, default `offline`                     |
+
+Esempio:
+
+```json
+{
+  "id": "…", "name": "nginx",
+  "endpoints": {
+    "docker": { "host": "milaz.it", "port": 8445, "status": "online" },
+    "kvm":    { "host": "milaz.it", "port": 9445, "status": "online" }
+  }
+}
+```
+
+> **Né il protocollo né l'ambiente sono campi del Target** — sono parametri
+> della misura e vivono su `SessionItem`; vedi la nota sul refactoring in fondo
+> a questa sezione. Lo `status` è **per endpoint**, non per motore: la stessa
+> build può essere raggiungibile in Docker e ferma in KVM, e un solo stato
+> complessivo perderebbe l'informazione.
 
 #### Scenario — collezione `scenarios`
 
@@ -178,25 +202,38 @@ Agente che esegue le misure.
 
 #### SessionItem — collezione `session_items`
 
-Unità di lavoro configurata: "misura *questo* scenario su *questo* target".
+Una **variante da misurare** dentro una sessione: "*questo* scenario, con
+*questo* protocollo, su *questo* ambiente".
 
-| Campo        | Tipo                | Vincoli                              |
-| ------------ | ------------------- | ------------------------------------ |
-| `id`         | `str`               | da `_id`                             |
-| `targetId`   | `str`               | riferimento a `targets._id`          |
-| `scenarioId` | `str`               | riferimento a `scenarios._id`        |
-| `clientId`   | `str`               | riferimento a `clients._id`          |
-| `reps`       | `int`               | ≥ 1, numero di ripetizioni           |
-| `timeout`    | `int`               | ms, ≥ 1                              |
+| Campo         | Tipo                   | Vincoli                          |
+| ------------- | ---------------------- | -------------------------------- |
+| `id`          | `str`                  | da `_id`                         |
+| `scenarioId`  | `str`                  | riferimento a `scenarios._id`    |
+| `protocol`    | `"HTTP/2" \| "HTTP/3"` | enum, **obbligatorio**           |
+| `environment` | `"docker" \| "kvm"`    | enum, **obbligatorio**; seleziona l'endpoint del target |
+| `reps`        | `int`                  | ≥ 1, numero di ripetizioni       |
+| `timeout`     | `int`                  | ms, ≥ 1                          |
+
+**Non ha `targetId` né `clientId`**: sono della `Session` che lo esegue, uguali
+per tutti i suoi item. Qui resta solo ciò che *varia* fra un item e l'altro —
+la terna *(scenario, protocollo, ambiente)*, cioè le tre dimensioni del
+confronto.
+
+È il `SessionItem` — non il `Target` — a decidere protocollo e ambiente: è lui
+la fonte di verità che `measurement.runner` legge per scegliere il flag di curl
+o di Chrome **e** per risolvere l'endpoint da interrogare (§3.6).
 
 #### Session — collezione `sessions`
 
-Esecuzione di un insieme ordinato di `SessionItem`.
+Esecuzione di un insieme ordinato di `SessionItem`: **un motore, misurato da un
+client**, declinato su più scenari, protocolli e ambienti.
 
 | Campo          | Tipo                                     | Vincoli                             |
 | -------------- | ---------------------------------------- | ----------------------------------- |
 | `id`           | `str`                                    | da `_id`                            |
 | `name`         | `str`                                    | 1–120 char                          |
+| `targetId`     | `str`                                    | riferimento a `targets._id`; il motore sotto test |
+| `clientId`     | `str`                                    | riferimento a `clients._id`; il motore di misura |
 | `when`         | `datetime`                               | UTC, ISO-8601                       |
 | `status`       | `"pending"\|"running"\|"completed"\|"failed"` | default `pending`; `failed` se almeno un item termina `failed` |
 | `currentIndex` | `int`                                    | ≥ 0, indice dell'item in esecuzione |
@@ -224,6 +261,8 @@ Esito di una singola ripetizione.
 | `sessionItemId` | `str`                      | riferimento a `session_items`            |
 | `targetId`      | `str`                      | riferimento a `targets`; il target su cui è stata eseguita la misura |
 | `clientId`      | `str`                      | riferimento a `clients`; il motore che ha prodotto la misura |
+| `scenarioId`    | `str`                      | riferimento a `scenarios`; lo scenario misurato |
+| `environment`   | `"docker" \| "kvm"`        | ambiente su cui è stata eseguita la misura |
 | `idx`           | `int`                      | ≥ 0, indice della ripetizione            |
 | `target`        | `str`                      | snapshot leggibile del target            |
 | `scenarioPath`  | `str`                      | snapshot del path richiesto              |
@@ -269,12 +308,23 @@ ricostruito risalendo `Result → SessionItem → Client`, con lo stesso rischio
 matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
 `GET /api/results`.
 
-> **Nota di migrazione.** `targetId` e `clientId` sono **obbligatori**: i
-> `Result` scritti prima della loro introduzione non li avevano e la loro
-> validazione fallirebbe. Entrambe le volte i documenti esistenti sono stati
-> aggiornati con un backfill idempotente che ricava il valore dal `SessionItem`
-> referenziato. Se in futuro si aggiungesse un altro riferimento obbligatorio a
-> `Result`, va previsto lo stesso passaggio prima di rimettere in servizio l'API.
+**`scenarioId`.** Completa la terna delle FK esplicite (`targetId`,
+`clientId`, `scenarioId`), con la stessa logica e gli stessi due punti di
+popolamento. `scenarioPath` resta lo snapshot testuale, ma **non** identifica
+lo scenario: due scenari distinti possono condividere lo stesso path, e un
+path può essere modificato dopo la misura. È la dimensione `scenario`
+dell'aggregazione (§5.8) e il filtro `?scenarioId=` di `GET /api/results`.
+
+> **Nota di migrazione.** `targetId`, `clientId` e `scenarioId` sono
+> **obbligatori**: i `Result` scritti prima della loro introduzione non li
+> avevano e la loro validazione fallirebbe. Ogni volta i documenti esistenti
+> sono stati aggiornati con un backfill idempotente che ricava il valore dal
+> `SessionItem` referenziato — possibile perché quel riferimento è sempre
+> risultato ancora risolvibile (per `scenarioId`: 3500/3500 record migrati, 0
+> orfani). Se in futuro si aggiungesse un altro riferimento obbligatorio a
+> `Result`, va previsto lo stesso passaggio prima di rimettere in servizio
+> l'API: **prima** verificare che il valore sia ricostruibile, e solo allora
+> renderlo obbligatorio.
 >
 > `responseCode` ha seguito un percorso diverso, deliberatamente: è
 > **opzionale** (`int | None`), non obbligatorio. Un backfill avrebbe dovuto
@@ -285,6 +335,69 @@ matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
 > `completed` avrebbe nascosto esattamente il problema che questo campo esiste
 > per rendere visibile. Meglio `null` onesto ("non registrato all'epoca") che
 > un numero plausibile ma inventato su un dataset di misure reali.
+
+#### Refactoring: protocollo e ambiente sono parametri della misura
+
+Inizialmente il `Target` portava **sia** il protocollo **sia** l'ambiente
+(quest'ultimo come `tag`, una stringa libera). Era modellazione sbagliata, con
+un costo concreto e crescente: lo stesso motore andava censito una volta per
+ogni combinazione. Tre motori × due ambienti × due protocolli = **dodici**
+`Target` per tre software reali, con nomi duplicati nell'interfaccia, `tag` da
+tenere allineati a mano, e un `targetId` che non identificava il motore ma la
+tripla *(motore, ambiente, protocollo)* — rendendo ambigua ogni aggregazione
+"per target".
+
+Il principio che risolve tutto: **né il protocollo né l'ambiente sono attributi
+del server**. Sono *parametri della misura*. Lo stesso motore, sullo stesso
+codice, può essere interrogato in HTTP/2 o HTTP/3, e può girare in container o
+su VM — ed è esattamente ciò che l'applicazione esiste per confrontare.
+Stanno quindi su `SessionItem`, accanto agli altri parametri (`reps`,
+`timeout`).
+
+Il modello che ne risulta:
+
+```
+Target (il motore)          "nginx", endpoints: { docker: …, kvm: … }
+  └── Session               un Target + un Client, una tornata di misure
+        └── SessionItem     scenario × protocollo × ambiente
+              └── Result    l'esito di una singola ripetizione
+```
+
+Conseguenze:
+
+* **`Target`** perde `protocol`, `tag`, `host`, `port` e `status` di primo
+  livello; guadagna `endpoints`, un dizionario a chiavi chiuse (`docker`,
+  `kvm`) di `{host, port, status}`. Dodici righe sono state consolidate in
+  **tre**, una per motore.
+* **`Session`** guadagna `targetId` e `clientId`: una sessione è un motore
+  misurato da un client, e ripeterli su ogni item sarebbe stata duplicazione
+  pura (oltre che un invito all'incoerenza).
+* **`SessionItem`** perde `targetId`/`clientId` e guadagna `environment`.
+  Resta solo ciò che varia fra un item e l'altro.
+* **`Result`** guadagna `environment`, allo stesso titolo di
+  `targetId`/`clientId`/`scenarioId`: è la dimensione del confronto
+  containerizzato vs virtualizzato, e averla sul risultato evita di risalire al
+  `SessionItem` a ogni aggregazione.
+* **La creazione batch** genera ora Scenario × Protocollo × Ambiente (§3.5):
+  target e client non sono più nel prodotto perché li fissa la sessione.
+* **L'aggregazione** sostituisce la dimensione `tag` con `environment` (§5.8).
+  Non è una ridenominazione di comodo: `tag` era una stringa libera sul
+  `Target`, `environment` è un enum chiuso sul `Result` — niente più `$lookup`,
+  niente più valori incoerenti fra righe duplicate.
+* **Gli enum `Protocol` ed `Environment`** vivono in `models/common.py`:
+  sono tipi trasversali (parametro della misura, dato dell'esito, chiave di
+  risoluzione dell'endpoint), non attributi di una singola entità.
+* **I dati storici** (`results`, `sessions`, `session_items`) sono stati
+  **svuotati**, non migrati: nel nuovo modello ogni item ha protocollo e
+  ambiente, e ogni sessione ha target e client — informazioni che nei dati
+  preesistenti erano distribuite su entità che il consolidamento stava
+  eliminando. Scelta concordata, trattandosi di misure riproducibili
+  rilanciando le sessioni. `scenarios` e `clients` sono stati preservati.
+* **Un target è stato perso nel consolidamento**: `Google` (`google.it:443`)
+  aveva `tag="extra"`, non mappabile su `{docker, kvm}`. Nel nuovo schema un
+  target esiste in uno o entrambi gli ambienti del confronto; un endpoint
+  pubblico di controllo non ha più una casella. Se dovesse tornare utile, va
+  ricreato con l'ambiente in cui lo si vuole collocare.
 
 ### 3.4 Pattern dei modelli Pydantic
 
@@ -300,6 +413,80 @@ i modelli completi ereditano inoltre da `MongoDocument`, che aggiunge `id`.
 
 `extra="forbid"` è deliberato: un campo scritto male dal client deve produrre un
 `422` esplicito, non essere silenziosamente ignorato.
+
+### 3.5 Creazione batch dei SessionItem
+
+`POST /api/session-items/batch` è l'endpoint del wizard "Nuova sessione". Non
+riceve una lista di item già espansa: riceve una **specifica**, e il prodotto
+cartesiano lo costruisce il backend.
+
+```json
+{
+  "scenarioIds":  ["…", "…", "…"],
+  "protocols":    ["HTTP/2", "HTTP/3"],
+  "environments": ["docker", "kvm"],
+  "reps":         20,
+  "timeout":      10000
+}
+```
+
+Genera **Scenario × Protocollo × Ambiente** — nell'esempio 3 × 2 × 2 = 12
+`SessionItem`, tutti con gli stessi `reps` e `timeout`. Risponde `201` con
+`{"ids": [...]}` in ordine deterministico: scenario esterno, poi protocollo,
+poi ambiente, così il chiamante può correlare gli id alle combinazioni
+richieste senza rileggerli.
+
+Dettagli non ovvi:
+
+* **Target e client non compaiono** nella specifica: sono scelte della
+  `Session` che raccoglierà questi item (§3.3), uguali per tutti. Il wizard li
+  seleziona una volta sola, all'inizio.
+* **`protocols` ed `environments` sono assi espliciti** per effetto del
+  refactoring (§3.3): finché protocollo e ambiente stavano sul `Target`, il
+  prodotto era Target × Scenario e le due dimensioni erano implicite nella
+  selezione dei target duplicati. Ora sono scelte dichiarate.
+* **I tre insiemi sono deduplicati** preservando l'ordine: lo stesso scenario o
+  protocollo indicato due volte genererebbe altrimenti item identici che
+  l'utente non ha chiesto.
+* **Lista vuota → `422`** (`min_length=1` sui tre array), prima di toccare il
+  database.
+* **Gli scenari non sono verificati** al momento della creazione: un id
+  inesistente produce un item che fallirà con `NOT_FOUND` alla prima
+  esecuzione, tracciato come tale (§5.4). Validarli qui costerebbe N query per
+  un errore che il runner intercetta comunque.
+
+> **Cambiamento incompatibile.** Il frontend va aggiornato: il wizard deve ora
+> scegliere target e client **per la sessione**, e scenari/protocolli/ambienti
+> come selezioni multiple per il prodotto.
+
+### 3.6 Risoluzione dell'endpoint in fase di misura
+
+L'`environment` del `SessionItem` non è un'etichetta descrittiva: è la **chiave
+con cui si sceglie l'indirizzo da interrogare**. La risoluzione avviene una
+sola volta per item, in `measurement.runner.resolve_context`:
+
+```python
+target   = await targets_service.get_target(target_id)      # dalla Session
+endpoint = target.endpoints[session_item.environment]        # docker | kvm
+url      = build_url(endpoint.host, endpoint.port, scenario.path)
+```
+
+Concretamente, con il target `nginx` dell'esempio in §3.3:
+
+| `SessionItem` | endpoint risolto | URL misurato |
+| ------------- | ---------------- | ------------ |
+| `environment="docker"`, `protocol="HTTP/2"` | `milaz.it:8445` | `https://milaz.it:8445/…` con `--http2` |
+| `environment="kvm"`, `protocol="HTTP/3"` | `milaz.it:9445` | `https://milaz.it:9445/…` con `--http3` |
+
+Due proprietà che ne derivano:
+
+* **Un target che non espone l'ambiente richiesto** solleva `NotFoundError`:
+  l'item viene marcato `failed` e tracciato con un `Result` segnaposto (§5.4),
+  senza interrompere gli altri item della sessione.
+* **Lo snapshot `Result.target` include l'ambiente** —
+  `"nginx [docker] (milaz.it:8445)"` — perché lo stesso `Target` produce misure
+  su due endpoint diversi, e un'etichetta che non li distinguesse renderebbe i
+  risultati ambigui a colpo d'occhio.
 
 ---
 
@@ -864,7 +1051,13 @@ può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
 | `?sessionId=` | i risultati di **una** esecuzione. Filtro **preferito**: diretto e senza ambiguità |
 | `?sessionItemIds=` | lista comma-separated; mantenuto per compatibilità ma ambiguo (un `SessionItem` può essere condiviso fra sessioni, §3.3) |
 | `?clientId=` | il motore che ha prodotto la misura, per il confronto curl vs Chrome |
-| `?scenarioPath=` | confronto esatto sul path richiesto |
+| `?targetId=` | il server sotto test |
+| `?scenarioId=` | lo scenario, per riferimento diretto |
+| `?scenarioPath=` | confronto esatto sul path richiesto; è uno snapshot testuale, `?scenarioId=` è più preciso |
+
+Gli stessi identici filtri valgono per `GET /api/results/aggregate` (§5.8):
+sono costruiti da un'unica funzione condivisa, `results_service.build_filter_query`,
+proprio perché due copie divergerebbero alla prima aggiunta.
 
 #### Paginazione
 
@@ -907,6 +1100,88 @@ o saltare documenti.
 > `?pageSize=`, `GET /api/results` restituisce ora al massimo 50 elementi
 > dentro `items`. Il frontend va aggiornato a leggere `items`/`total` e a
 > paginare (o a passare `?pageSize=200` e iterare su `page`).
+
+### 5.8 Aggregazione e indici
+
+#### `GET /api/results/aggregate`
+
+Restituisce **solo medie**, mai risultati grezzi: è pensato per alimentare i
+grafici comparativi senza trasferire decine di migliaia di documenti al
+frontend. Tutto il calcolo avviene nel database, con una pipeline di
+aggregazione MongoDB (`$match` → eventuale `$lookup` → `$group` → `$sort`).
+
+| Parametro | Valori | Note |
+| --------- | ------ | ---- |
+| `?groupBy=` | `target` \| `environment` \| `client` \| `scenario` | **obbligatorio** |
+| `?metric=` | `total` \| `ttfb` \| `kb` | default `total` |
+| *filtri* | gli **stessi** di `GET /api/results` (§5.7) | in AND |
+
+Tre proprietà non ovvie, tutte deliberate:
+
+* **Il protocollo è sempre parte della chiave di raggruppamento.** Ogni gruppo
+  è una coppia *dimensione × protocollo*, mai una dimensione sola: il confronto
+  HTTP/2 vs HTTP/3 è l'oggetto stesso dell'applicazione, e una media che li
+  mescolasse non avrebbe alcun significato.
+* **Solo `status="completed"` entra nel calcolo.** Una misura fallita ha
+  `total`/`ttfb`/`kb` azzerati per costruzione (§5.3): includerla abbasserebbe
+  le medie **in proporzione al tasso di fallimento**, facendo sembrare più
+  veloce un target che sta semplicemente fallendo di più — l'esatto contrario
+  della verità. Misurato sui dati reali: media di `total` 28,00 ms includendo
+  i fallimenti contro 29,28 ms sui soli `completed`. Il campo `considered`
+  della risposta dichiara quante misure sono entrate nel calcolo, così lo
+  scarto rispetto al totale filtrato resta visibile.
+* **`groupBy=environment`** confronta Docker e KVM a parità di tutto il resto.
+  Sostituisce il vecchio `groupBy=tag`: `tag` era una stringa libera sul
+  `Target`, `environment` è un enum chiuso salvato direttamente sul `Result`
+  (§3.3) — il che elimina sia il `$lookup` sia il rischio di valori incoerenti.
+
+L'etichetta leggibile di ogni gruppo viene, dove possibile, dai campi già
+presenti nel `Result` (`target`, `scenarioPath`, `environment`): nessun
+`$lookup` per `target`, `scenario` ed `environment`. Solo `client` richiede una
+join — con `$toObjectId`, perché nei `Result` gli id sono **stringhe** mentre
+gli `_id` sono `ObjectId` e Mongo non converte implicitamente.
+
+> **Ordine delle rotte.** `GET /results/aggregate` è dichiarato **prima** di
+> `GET /results/{result_id}` in `routers/results.py`: sono entrambe `GET` sullo
+> stesso livello di path e FastAPI risolve nell'ordine di dichiarazione.
+> Invertendole, `/aggregate` verrebbe interpretato come un `result_id` e
+> produrrebbe un `422`.
+
+#### Indici della collezione `results`
+
+Creati all'avvio da `db.mongo.ensure_indexes()` (idempotente: `create_index`
+non fa nulla se l'indice esiste già). Solo su `results`, l'unica collezione che
+cresce senza limite; su target, scenari e client — decine di documenti — un
+indice costerebbe più della scansione che evita. Un fallimento nella creazione
+viene loggato ma **non** blocca l'avvio, coerentemente con `connect_to_mongo`.
+
+| Indice | Chiave | Serve a |
+| ------ | ------ | ------- |
+| `ix_session_status` | `{sessionId, status}` | filtro per esecuzione, cascata di cancellazione |
+| `ix_target_status` | `{targetId, status}` | aggregazione/confronto per server |
+| `ix_scenario_client_status` | `{scenarioId, clientId, status}` | aggregazione per scenario incrociata col motore |
+| `ix_session_time_id` | `{sessionId, time, _id}` | paginazione di `GET /api/results` |
+| `ix_session_item` | `{sessionId, sessionItemId}` | pulizia pre-run di un singolo item |
+
+Verificato con `explain()` che ogni query principale usi effettivamente
+l'indice previsto, con `totalDocsExamined == nReturned` (nessun documento letto
+inutilmente):
+
+| Query | Piano | Indice |
+| ----- | ----- | ------ |
+| `?sessionId=` + sort + `skip/limit` | `IXSCAN`, nessun sort in memoria | `ix_session_time_id` |
+| `{sessionId, status}` | `IXSCAN` | `ix_session_status` |
+| `{targetId, status}` | `IXSCAN` | `ix_target_status` |
+| `{scenarioId, clientId, status}` | `IXSCAN` | `ix_scenario_client_status` |
+| `{sessionId, sessionItemId}` | `IXSCAN` | `ix_session_item` |
+
+`ix_session_time_id` **non** era fra gli indici pensati inizialmente, ma
+l'`explain()` ne ha mostrato la necessità: la paginazione ordina per
+`(time, _id)`, e con il solo `ix_session_status` Mongo eseguiva un `SORT` in
+memoria esaminando **282** documenti per restituirne 50. Con l'indice che
+include anche le chiavi di ordinamento ne esamina esattamente **50**, senza
+stage di sort. È il caso tipico in cui un indice sui soli campi di filtro non
+basta: se la query ordina, l'ordinamento va fatto entrare nell'indice.
 
 ---
 

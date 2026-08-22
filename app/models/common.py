@@ -1,10 +1,45 @@
 """Tipi e classi base condivisi da tutti i modelli Pydantic."""
 
+from enum import StrEnum
 from typing import Annotated, Any
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+
+class Protocol(StrEnum):
+    """Protocollo applicativo sotto confronto.
+
+    Vive qui e non in un modulo di entità perché è **trasversale**: è un
+    parametro della misura (``SessionItem.protocol``), un dato dell'esito
+    (``Result.proto`` / ``Result.actualProto``), un campo di avanzamento
+    (``SessionProgressItem.proto``) e il tipo su cui è parametrizzato ogni
+    motore di misura. Stava in ``target.py`` finché il protocollo era un
+    attributo del server sotto test; non lo è più (vedi AGENTS.md §3.3).
+    """
+
+    HTTP2 = "HTTP/2"
+    HTTP3 = "HTTP/3"
+
+
+class Environment(StrEnum):
+    """Ambiente di deploy su cui gira l'istanza del server sotto test.
+
+    Trasversale come ``Protocol`` e per la stessa ragione: è un parametro della
+    misura (``SessionItem.environment``), un dato dell'esito
+    (``Result.environment``) **e** la chiave con cui si sceglie l'endpoint da
+    interrogare (``Target.endpoints[environment]``, vedi AGENTS.md §3.3).
+
+    I valori sono chiusi di proposito: il confronto containerizzato vs
+    virtualizzato nativo è una dimensione fissa dell'esperimento, non
+    un'etichetta libera. Prima era codificata nel campo ``tag`` del ``Target``,
+    con tutti i limiti di una stringa arbitraria (refusi, valori incoerenti fra
+    le righe duplicate dello stesso server).
+    """
+
+    DOCKER = "docker"
+    KVM = "kvm"
 
 
 def _to_object_id_str(value: Any) -> Any:

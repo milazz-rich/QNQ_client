@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.core.cors import setup_cors
 from app.core.errors import register_exception_handlers
-from app.db.mongo import close_mongo_connection, connect_to_mongo
+from app.db.mongo import close_mongo_connection, connect_to_mongo, ensure_indexes
 from app.routers import (
     clients,
     health,
@@ -38,9 +38,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         Un async context manager che cede il controllo mentre l'app è in esecuzione.
 
     Fa:
-        All'avvio apre la connessione a MongoDB, allo spegnimento la chiude.
+        All'avvio apre la connessione a MongoDB e verifica gli indici della
+        collezione ``results`` (operazione idempotente, vedi
+        ``ensure_indexes``), allo spegnimento chiude la connessione.
     """
     await connect_to_mongo()
+    await ensure_indexes()
     yield
     await close_mongo_connection()
 

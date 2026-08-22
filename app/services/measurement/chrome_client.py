@@ -25,7 +25,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.core.config import settings
-from app.models.target import Protocol
+from app.models.common import Protocol
 from app.services.measurement.curl_client import Measurement, is_http_success
 
 logger = logging.getLogger(__name__)

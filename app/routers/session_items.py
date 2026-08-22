@@ -14,6 +14,7 @@ from fastapi import APIRouter, Path, status
 from app.models.common import ErrorResponse
 from app.models.session_item import (
     SessionItem,
+    SessionItemBatchCreate,
     SessionItemBatchResult,
     SessionItemCreate,
     SessionItemUpdate,
@@ -96,22 +97,29 @@ async def create_session_item(payload: SessionItemCreate) -> SessionItem:
     "/batch",
     response_model=SessionItemBatchResult,
     status_code=status.HTTP_201_CREATED,
-    summary="Crea più session item in un'unica chiamata",
+    summary="Genera il prodotto Scenario × Protocollo × Ambiente",
 )
-async def create_session_items_batch(payload: list[SessionItemCreate]) -> SessionItemBatchResult:
-    """Crea più session item in un'unica operazione.
+async def create_session_items_batch(
+    payload: SessionItemBatchCreate,
+) -> SessionItemBatchResult:
+    """Genera e crea il prodotto cartesiano richiesto dal wizard.
 
     Riceve:
-        payload: la lista di ``SessionItemCreate`` da creare, tipicamente il
-            prodotto cartesiano Target × Scenario generato dal wizard di
-            creazione sessione nel frontend.
+        payload: la **specifica** — ``scenarioIds``, ``protocols``,
+            ``environments`` più i parametri comuni (``reps``, ``timeout``).
+            Non una lista di item già espansa: è il backend a costruire il
+            prodotto. Target e client non compaiono: sono della ``Session``.
 
     Restituisce:
-        ``201`` con gli ``id`` creati, nello stesso ordine dei payload in ingresso.
+        ``201`` con gli ``id`` creati, in ordine deterministico (scenario
+        esterno, poi protocollo, poi ambiente).
 
     Fa:
         Delega a ``session_items_service.create_session_items_batch``. Una
-        lista vuota produce un ``422 VALIDATION_ERROR`` senza toccare il database.
+        lista vuota fra ``scenarioIds``/``protocols``/``environments`` produce
+        un ``422 VALIDATION_ERROR`` da FastAPI (``min_length=1``) senza toccare
+        il database. I valori ripetuti sono deduplicati, per non generare item
+        identici non richiesti.
     """
     ids = await session_items_service.create_session_items_batch(payload)
     return SessionItemBatchResult(ids=ids)

@@ -5,8 +5,7 @@ from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from app.models.common import MongoDocument, MongoId, MongoModel
-from app.models.target import Protocol
+from app.models.common import MongoDocument, MongoId, MongoModel, Protocol
 
 
 class RunStatus(StrEnum):
@@ -61,9 +60,20 @@ class SessionProgressItem(MongoModel):
 
 
 class SessionBase(MongoModel):
-    """Campi comuni a creazione e rappresentazione di una Session."""
+    """Campi comuni a creazione e rappresentazione di una Session.
+
+    Una sessione è **un motore misurato da un client**, declinato su più
+    scenari, protocolli e ambienti: ``targetId`` e ``clientId`` sono quindi
+    suoi, non dei singoli ``SessionItem``, che li ereditano tutti uguali.
+    """
 
     name: str = Field(min_length=1, max_length=120, description="Nome leggibile della sessione")
+    target_id: MongoId = Field(
+        alias="targetId", description="Motore sotto test, uguale per tutti gli item"
+    )
+    client_id: MongoId = Field(
+        alias="clientId", description="Client che esegue le misure, uguale per tutti gli item"
+    )
     when: datetime = Field(description="Istante di pianificazione o avvio, in UTC")
     status: RunStatus = Field(default=RunStatus.PENDING, description="Stato della sessione")
     current_index: int = Field(
@@ -82,6 +92,8 @@ class SessionUpdate(MongoModel):
     """Payload di ``PUT /api/sessions/{id}``: ogni campo omesso resta invariato."""
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
+    target_id: MongoId | None = Field(default=None, alias="targetId")
+    client_id: MongoId | None = Field(default=None, alias="clientId")
     when: datetime | None = None
     status: RunStatus | None = None
     current_index: int | None = Field(default=None, alias="currentIndex", ge=0)

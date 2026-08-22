@@ -7,6 +7,7 @@ from pymongo.errors import PyMongoError
 
 from app.core.config import settings
 from app.core.errors import DatabaseError
+from app.db.collections import RESULTS
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,61 @@ async def connect_to_mongo() -> None:
         )
     else:
         logger.info("MongoDB connesso.")
+
+
+async def ensure_indexes() -> None:
+    """Crea gli indici della collezione ``results``, se non esistono già.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        ``None``.
+
+    Fa:
+        ``create_index`` è idempotente: se l'indice esiste con la stessa
+        definizione non fa nulla, quindi la funzione può girare a ogni avvio.
+        Gli indici sono **solo** su ``results`` perché è l'unica collezione che
+        cresce senza limite (migliaia di documenti per sessione), mentre
+        target, scenari e client restano nell'ordine delle decine e una
+        scansione completa lì è più economica di un indice da mantenere.
+
+        Un fallimento viene registrato ma **non** blocca l'avvio, coerentemente
+        con ``connect_to_mongo``: senza indici l'applicazione funziona comunque,
+        solo più lentamente, e deve poter partire per essere diagnosticata.
+
+        Le combinazioni scelte rispecchiano i filtri realmente usati da
+        ``results_service`` (vedi AGENTS.md §5.8).
+    """
+    if _database is None:
+        logger.warning("Indici non creati: connessione al database non inizializzata.")
+        return
+
+    collection = _database[RESULTS]
+    try:
+        # Filtro per singola esecuzione, il più frequente (lettura dei risultati
+        # di una sessione, cancellazione a cascata, pulizia pre-run).
+        await collection.create_index([("sessionId", 1), ("status", 1)], name="ix_session_status")
+        # Confronto fra protocolli/ambienti sullo stesso server sotto test.
+        await collection.create_index([("targetId", 1), ("status", 1)], name="ix_target_status")
+        # Aggregazioni per scenario, tipicamente incrociate col motore di misura.
+        await collection.create_index(
+            [("scenarioId", 1), ("clientId", 1), ("status", 1)], name="ix_scenario_client_status"
+        )
+        # Paginazione di GET /api/results: l'ordinamento (time, _id) è parte
+        # dell'indice, altrimenti Mongo dovrebbe ordinare in memoria l'intero
+        # risultato del filtro prima di applicare skip/limit.
+        await collection.create_index(
+            [("sessionId", 1), ("time", 1), ("_id", 1)], name="ix_session_time_id"
+        )
+        # Pulizia pre-run di un singolo item all'interno di una sessione.
+        await collection.create_index(
+            [("sessionId", 1), ("sessionItemId", 1)], name="ix_session_item"
+        )
+    except PyMongoError as exc:
+        logger.warning("Impossibile creare gli indici su '%s': %s", RESULTS, exc)
+    else:
+        logger.info("Indici su '%s' verificati.", RESULTS)
 
 
 async def close_mongo_connection() -> None:

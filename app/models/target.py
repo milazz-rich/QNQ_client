@@ -1,31 +1,35 @@
-"""Modelli dell'entità Target: il server sotto test."""
+"""Modelli dell'entità Target: il motore web sotto test.
+
+Un ``Target`` è un **motore** (Caddy, nginx, OpenLiteSpeed), non un singolo
+endpoint di rete: lo stesso motore è deployato in più ambienti, e i suoi
+indirizzi vivono in ``endpoints``, indicizzati per ``Environment``. Né il
+protocollo né l'ambiente sono attributi del server — sono parametri della
+misura, e stanno su ``SessionItem`` (vedi AGENTS.md §3.3).
+"""
 
 from enum import StrEnum
 
 from pydantic import Field
 
-from app.models.common import MongoDocument, MongoModel
-
-
-class Protocol(StrEnum):
-    """Protocollo applicativo usato per la misura."""
-
-    HTTP2 = "HTTP/2"
-    HTTP3 = "HTTP/3"
+from app.models.common import Environment, MongoDocument, MongoModel
 
 
 class TargetStatus(StrEnum):
-    """Stato di disponibilità di un target."""
+    """Stato di disponibilità di un endpoint."""
 
     ONLINE = "online"
     IDLE = "idle"
     OFFLINE = "offline"
 
 
-class TargetBase(MongoModel):
-    """Campi comuni a creazione e rappresentazione di un Target."""
+class TargetEndpoint(MongoModel):
+    """Indirizzo del motore in uno specifico ambiente.
 
-    name: str = Field(min_length=1, max_length=120, description="Nome leggibile del target")
+    Lo stato è **per endpoint**, non per motore: la stessa build può essere
+    raggiungibile in Docker e ferma in KVM, e tenerne un solo stato
+    complessivo perderebbe l'informazione.
+    """
+
     host: str = Field(
         min_length=1,
         max_length=255,
@@ -33,11 +37,25 @@ class TargetBase(MongoModel):
         description="Hostname o indirizzo IP, senza schema e senza porta",
     )
     port: int = Field(ge=1, le=65535, description="Porta TCP/UDP del servizio")
-    protocol: Protocol = Field(description="Protocollo esposto dal target")
     status: TargetStatus = Field(
-        default=TargetStatus.OFFLINE, description="Stato di disponibilità"
+        default=TargetStatus.OFFLINE, description="Stato di disponibilità di questo endpoint"
     )
-    tag: str = Field(default="", max_length=40, description="Etichetta breve di categoria")
+
+
+class TargetBase(MongoModel):
+    """Campi comuni a creazione e rappresentazione di un Target."""
+
+    name: str = Field(
+        min_length=1, max_length=120, description="Nome del motore (es. 'nginx')"
+    )
+    endpoints: dict[Environment, TargetEndpoint] = Field(
+        description=(
+            "Indirizzo del motore per ciascun ambiente. Le chiavi sono i valori "
+            "di Environment ('docker', 'kvm'): un dizionario a chiavi chiuse, "
+            "non una lista, perché la risoluzione in fase di misura è un "
+            "accesso diretto per ambiente — vedi measurement.runner"
+        )
+    )
 
 
 class TargetCreate(TargetBase):
@@ -45,16 +63,15 @@ class TargetCreate(TargetBase):
 
 
 class TargetUpdate(MongoModel):
-    """Payload di ``PUT /api/targets/{id}``: ogni campo omesso resta invariato."""
+    """Payload di ``PUT /api/targets/{id}``: ogni campo omesso resta invariato.
+
+    ``endpoints`` si aggiorna in blocco: inviarlo sostituisce l'intera mappa,
+    non fa merge per ambiente. È deliberato — un merge parziale renderebbe
+    impossibile *rimuovere* un ambiente, e la mappa ha al più due voci.
+    """
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    host: str | None = Field(
-        default=None, min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._:\-\[\]]+$"
-    )
-    port: int | None = Field(default=None, ge=1, le=65535)
-    protocol: Protocol | None = None
-    status: TargetStatus | None = None
-    tag: str | None = Field(default=None, max_length=40)
+    endpoints: dict[Environment, TargetEndpoint] | None = None
 
 
 class Target(TargetBase, MongoDocument):

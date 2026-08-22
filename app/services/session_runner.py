@@ -106,7 +106,7 @@ async def _run_items(session: Session) -> bool:
         )
         final_status = RunStatus.COMPLETED
         try:
-            item_succeeded = await _run_single_item(session.id, index, item)
+            item_succeeded = await _run_single_item(session, index, item)
             if not item_succeeded:
                 final_status = RunStatus.FAILED
                 any_item_failed = True
@@ -120,23 +120,25 @@ async def _run_items(session: Session) -> bool:
             )
             final_status = RunStatus.FAILED
             any_item_failed = True
-            await _save_skipped_item_result(session.id, item, exc.message)
+            await _save_skipped_item_result(session, item, exc.message)
         except Exception as exc:
             logger.exception("Item %d della sessione %s interrotto", index, session.id)
             final_status = RunStatus.FAILED
             any_item_failed = True
-            await _save_skipped_item_result(session.id, item, str(exc))
+            await _save_skipped_item_result(session, item, str(exc))
         finally:
             await sessions_service.update_item_progress(session.id, index, status=final_status)
     return not any_item_failed
 
 
-async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, reason: str) -> None:
+async def _save_skipped_item_result(
+    session: Session, item: SessionProgressItem, reason: str
+) -> None:
     """Tenta di salvare il ``Result`` segnaposto per un item mai misurato.
 
     Riceve:
-        session_id: identificativo della sessione in esecuzione, salvato in
-            ``Result.sessionId``.
+        session: la sessione in esecuzione; fornisce ``sessionId``, ``targetId``
+            e ``clientId``, che ora vivono sulla Session e non sull'item.
         item: l'item di avanzamento saltato, prima di qualunque ripetizione.
         reason: messaggio dell'errore che ha impedito la misura.
 
@@ -144,33 +146,33 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
         ``None``.
 
     Fa:
-        ``targetId`` e ``clientId`` sono riferimenti obbligatori in ``Result``:
-        per valorizzarli occorre recuperare il ``SessionItem`` di configurazione
-        (l'errore che ha fatto saltare l'item può derivare dalla risoluzione
-        di Target/Scenario/Client, ma il ``SessionItem`` stesso — e quindi i
-        riferimenti che contiene — è di solito ancora leggibile). Se anche il
-        ``SessionItem`` non esiste più (cancellato dopo essere stato
-        referenziato da questa sessione), non ci sono riferimenti a cui legare
-        il risultato: il fallimento resta comunque nei log applicativi, ma
-        nessun ``Result`` viene creato per questo item.
+        ``targetId`` e ``clientId`` sono sempre disponibili (li porta la
+        ``Session``), mentre ``scenarioId`` ed ``environment`` — anch'essi
+        obbligatori in ``Result`` — vivono sul ``SessionItem`` e vanno
+        riletti. Se il ``SessionItem`` non esiste più (cancellato dopo essere
+        stato referenziato da questa sessione) quei due valori non sono
+        ricostruibili: il fallimento resta nei log applicativi, ma nessun
+        ``Result`` viene creato per questo item.
     """
     try:
         session_item = await session_items_service.get_session_item(item.session_item_id)
     except AppError:
         logger.warning(
             "Nessun Result creato per l'item %d della sessione %s: "
-            "SessionItem '%s' non più risolvibile (targetId/clientId sconosciuti).",
+            "SessionItem '%s' non più risolvibile (scenarioId/environment sconosciuti).",
             item.done,
-            session_id,
+            session.id,
             item.session_item_id,
         )
         return
 
     result = ResultCreate(
-        sessionId=session_id,
+        sessionId=session.id,
         sessionItemId=item.session_item_id,
-        targetId=session_item.target_id,
-        clientId=session_item.client_id,
+        targetId=session.target_id,
+        clientId=session.client_id,
+        scenarioId=session_item.scenario_id,
+        environment=session_item.environment,
         idx=item.done,
         target=item.label,
         scenarioPath=f"(non eseguito: {reason})",
@@ -186,11 +188,12 @@ async def _save_skipped_item_result(session_id: str, item: SessionProgressItem, 
     await results_service.create_result(result)
 
 
-async def _run_single_item(session_id: str, index: int, item: SessionProgressItem) -> bool:
+async def _run_single_item(session: Session, index: int, item: SessionProgressItem) -> bool:
     """Esegue le ripetizioni di un singolo item di una sessione.
 
     Riceve:
-        session_id: identificativo della sessione in esecuzione.
+        session: la sessione in esecuzione; fornisce id, ``targetId`` e
+            ``clientId`` (che ora vivono sulla Session, non sull'item).
         index: posizione dell'item nella lista ``items``.
         item: l'item di avanzamento, che referenzia il ``SessionItem``.
 
@@ -205,8 +208,11 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         configurazione era rotta o il client non supportato.
 
     Fa:
-        Carica il ``SessionItem`` di configurazione, risolve target, scenario e
-        client (``NotImplementedFeatureError`` se il client non è curl), elimina
+        Carica il ``SessionItem`` di configurazione e risolve il contesto:
+        target e client vengono dalla ``Session``, mentre scenario, protocollo
+        e ambiente vengono dall'item — ed è l'ambiente a selezionare quale
+        endpoint del target interrogare (``target.endpoints[environment]``,
+        vedi ``measurement.runner.resolve_context``). Elimina
         gli eventuali risultati di una **precedente esecuzione di questa stessa
         sessione** per questo item — scoping per ``(sessionId, sessionItemId)``,
         non per solo ``sessionItemId``: il ``SessionItem`` può essere condiviso
@@ -224,27 +230,30 @@ async def _run_single_item(session_id: str, index: int, item: SessionProgressIte
         verità sul numero di ripetizioni.
     """
     session_item = await session_items_service.get_session_item(item.session_item_id)
-    context = await measurement_runner.resolve_context(session_item)
+    context = await measurement_runner.resolve_context(
+        session_item, target_id=session.target_id, client_id=session.client_id
+    )
 
-    await results_service.delete_results_by_session_and_item(session_id, session_item.id)
+    await results_service.delete_results_by_session_and_item(session.id, session_item.id)
     await sessions_service.update_item_progress(
-        session_id, index, total=session_item.reps, done=0
+        session.id, index, total=session_item.reps, done=0
     )
 
     logger.info(
-        "Item %d: %d ripetizioni %s su %s",
+        "Item %d: %d ripetizioni %s su %s [%s]",
         index,
         session_item.reps,
-        context.target.protocol.value,
+        session_item.protocol.value,
         context.url,
+        session_item.environment.value,
     )
 
     any_rep_failed = False
     for idx in range(session_item.reps):
-        result = await measurement_runner.measure_once(context, idx, session_id)
+        result = await measurement_runner.measure_once(context, idx, session.id)
         await results_service.create_result(result)
         if result.status is ResultStatus.FAILED:
             any_rep_failed = True
-        await sessions_service.update_item_progress(session_id, index, done=idx + 1)
+        await sessions_service.update_item_progress(session.id, index, done=idx + 1)
         await asyncio.sleep(settings.measurement_delay_ms / 1000)
     return not any_rep_failed

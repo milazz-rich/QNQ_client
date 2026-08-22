@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 
 from app.core.config import settings
-from app.models.target import Protocol
+from app.models.common import Protocol
 
 logger = logging.getLogger(__name__)
 

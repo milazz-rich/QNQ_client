@@ -9,7 +9,12 @@ from app.core.errors import DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SESSION_ITEMS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
-from app.models.session_item import SessionItem, SessionItemCreate, SessionItemUpdate
+from app.models.session_item import (
+    SessionItem,
+    SessionItemBatchCreate,
+    SessionItemCreate,
+    SessionItemUpdate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +89,61 @@ async def create_session_item(payload: SessionItemCreate) -> SessionItem:
     return SessionItem.model_validate({**document, "_id": insert_result.inserted_id})
 
 
-async def create_session_items_batch(payloads: list[SessionItemCreate]) -> list[str]:
-    """Crea più session item in un'unica operazione.
+async def create_session_items_batch(spec: SessionItemBatchCreate) -> list[str]:
+    """Genera e crea il prodotto cartesiano Scenario × Protocollo × Ambiente.
 
     Riceve:
-        payloads: la lista dei session item da creare, tipicamente il prodotto
-            cartesiano Target × Scenario generato dal wizard di creazione
-            sessione nel frontend.
+        spec: la specifica del wizard — quali scenari, quali protocolli, quali
+            ambienti, più i parametri comuni (reps, timeout).
 
     Restituisce:
-        La lista degli ``id`` (stringa) assegnati da MongoDB, nello stesso
-        ordine dei payload in ingresso.
+        La lista degli ``id`` (stringa) assegnati da MongoDB, nell'ordine di
+        generazione: scenario esterno, poi protocollo, poi ambiente.
 
     Fa:
-        Esegue un ``insert_many`` sulla collezione ``session_items``. Solleva
-        ``ValidationError`` se la lista è vuota, senza interrogare il database.
+        Costruisce il prodotto cartesiano **nel backend**: il wizard invia una
+        specifica compatta invece di N×M×P oggetti già espansi.
+
+        Target e client **non** compaiono nel prodotto: sono scelte della
+        ``Session`` che raccoglierà questi item, uguali per tutti (§3.3 di
+        AGENTS.md). Ciò che varia da item a item è solo la terna
+        *(scenario, protocollo, ambiente)* — le tre dimensioni del confronto.
+
+        I tre insiemi sono **deduplicati** preservando l'ordine di
+        inserimento: lo stesso scenario o protocollo indicato due volte
+        genererebbe altrimenti item identici, senza che l'utente lo abbia
+        chiesto. L'ordine di generazione è deterministico, così il chiamante
+        può correlare gli ``id`` restituiti alle combinazioni richieste senza
+        rileggerli.
+
+        Non verifica che gli scenari esistano: un id inesistente produce un
+        item che fallirà con ``NOT_FOUND`` alla prima esecuzione, tracciato
+        come tale (§5.4). Validarli qui richiederebbe N query aggiuntive per un
+        errore che il runner intercetta comunque.
     """
-    if not payloads:
-        raise ValidationError("La lista di session item da creare non può essere vuota.")
+    scenario_ids = list(dict.fromkeys(spec.scenario_ids))
+    protocols = list(dict.fromkeys(spec.protocols))
+    environments = list(dict.fromkeys(spec.environments))
+
+    payloads = [
+        SessionItemCreate(
+            scenarioId=scenario_id,
+            protocol=protocol,
+            environment=environment,
+            reps=spec.reps,
+            timeout=spec.timeout,
+        )
+        for scenario_id in scenario_ids
+        for protocol in protocols
+        for environment in environments
+    ]
+    logger.info(
+        "Batch: %d scenari × %d protocolli × %d ambienti = %d session item",
+        len(scenario_ids),
+        len(protocols),
+        len(environments),
+        len(payloads),
+    )
 
     collection = get_collection(SESSION_ITEMS)
     documents = [payload.model_dump(by_alias=True, mode="json") for payload in payloads]

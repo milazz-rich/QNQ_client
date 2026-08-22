@@ -5,8 +5,7 @@ from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from app.models.common import MongoDocument, MongoId, MongoModel
-from app.models.target import Protocol
+from app.models.common import Environment, MongoDocument, MongoId, MongoModel, Protocol
 
 
 class ResultStatus(StrEnum):
@@ -53,6 +52,23 @@ class ResultBase(MongoModel):
             "confrontare o filtrare le misure per motore (curl vs Chrome) senza "
             "doverlo dedurre risalendo al SessionItem."
         ),
+    )
+    scenario_id: MongoId = Field(
+        alias="scenarioId",
+        description=(
+            "Scenario misurato. Riferimento diretto, distinto dallo snapshot "
+            "in 'scenarioPath': due scenari possono condividere lo stesso path "
+            "(o uno scenario può essere rinominato), quindi solo scenarioId "
+            "identifica senza ambiguità la configurazione di origine."
+        ),
+    )
+    environment: Environment = Field(
+        description=(
+            "Ambiente su cui è stata eseguita la misura. Riferimento diretto "
+            "come targetId/clientId: è la dimensione del confronto "
+            "containerizzato vs virtualizzato, e averla qui evita di risalire "
+            "al SessionItem per ogni aggregazione (§5.8)."
+        )
     )
     idx: int = Field(ge=0, description="Indice della ripetizione, a partire da 0")
     target: str = Field(min_length=1, max_length=300, description="Snapshot leggibile del target")
@@ -147,4 +163,64 @@ class ResultPage(MongoModel):
     page_size: int = Field(
         ge=1, alias="pageSize", serialization_alias="pageSize",
         description="Dimensione di pagina effettivamente applicata",
+    )
+
+
+class AggregateDimension(StrEnum):
+    """Dimensione su cui raggruppare i risultati aggregati."""
+
+    TARGET = "target"
+    ENVIRONMENT = "environment"
+    CLIENT = "client"
+    SCENARIO = "scenario"
+
+
+class AggregateMetric(StrEnum):
+    """Metrica di cui calcolare la media."""
+
+    TOTAL = "total"
+    TTFB = "ttfb"
+    KB = "kb"
+
+
+class ResultAggregateGroup(MongoModel):
+    """Un gruppo dell'aggregazione: una dimensione × un protocollo."""
+
+    key: str = Field(
+        description=(
+            "Valore della dimensione: l'id dell'entità per target/client/"
+            "scenario, il tag stesso per groupBy=tag"
+        )
+    )
+    label: str = Field(description="Etichetta leggibile del gruppo")
+    proto: Protocol = Field(description="Protocollo richiesto, dimensione sempre presente")
+    avg: float = Field(ge=0, description="Media della metrica scelta sul gruppo")
+    count: int = Field(ge=0, description="Misure valide che compongono la media")
+
+
+class ResultAggregate(MongoModel):
+    """Esito di ``GET /api/results/aggregate``.
+
+    Restituisce **solo** i valori aggregati, mai i risultati grezzi: è pensato
+    per alimentare grafici comparativi senza trasferire migliaia di documenti.
+    """
+
+    group_by: AggregateDimension = Field(
+        alias="groupBy", serialization_alias="groupBy",
+        description="Dimensione di raggruppamento applicata",
+    )
+    metric: AggregateMetric = Field(description="Metrica mediata")
+    groups: list[ResultAggregateGroup] = Field(
+        description=(
+            "Un elemento per ogni combinazione dimensione × protocollo, "
+            "ordinato per etichetta e poi per protocollo"
+        )
+    )
+    considered: int = Field(
+        ge=0,
+        description=(
+            "Totale delle misure entrate nell'aggregazione: solo quelle con "
+            "status='completed', perché le fallite hanno metriche azzerate per "
+            "costruzione e falserebbero le medie"
+        ),
     )

@@ -2,11 +2,13 @@
 
 from app.models.client import Client, ClientBase, ClientCreate, ClientUpdate
 from app.models.common import (
+    Environment,
     ErrorDetail,
     ErrorResponse,
     MongoDocument,
     MongoId,
     MongoModel,
+    Protocol,
     to_object_id,
 )
 from app.models.result import Result, ResultBase, ResultCreate, ResultStatus
@@ -22,11 +24,19 @@ from app.models.session import (
 from app.models.session_item import (
     SessionItem,
     SessionItemBase,
+    SessionItemBatchCreate,
     SessionItemBatchResult,
     SessionItemCreate,
     SessionItemUpdate,
 )
-from app.models.target import Protocol, Target, TargetBase, TargetCreate, TargetStatus, TargetUpdate
+from app.models.target import (
+    Target,
+    TargetBase,
+    TargetCreate,
+    TargetEndpoint,
+    TargetStatus,
+    TargetUpdate,
+)
 
 __all__ = [
     # common
@@ -34,13 +44,15 @@ __all__ = [
     "ErrorResponse",
     "MongoDocument",
     "MongoId",
+    "Environment",
     "MongoModel",
+    "Protocol",
     "to_object_id",
     # target
-    "Protocol",
     "Target",
     "TargetBase",
     "TargetCreate",
+    "TargetEndpoint",
     "TargetStatus",
     "TargetUpdate",
     # scenario
@@ -56,6 +68,7 @@ __all__ = [
     # session item
     "SessionItem",
     "SessionItemBase",
+    "SessionItemBatchCreate",
     "SessionItemBatchResult",
     "SessionItemCreate",
     "SessionItemUpdate",
