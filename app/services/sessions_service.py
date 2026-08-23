@@ -5,6 +5,7 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
+from app.core import session_logging
 from app.core.errors import DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SESSIONS
 from app.db.mongo import get_collection
@@ -156,7 +157,58 @@ async def delete_session(session_id: str) -> None:
         raise DatabaseError("Impossibile eliminare la sessione.") from exc
     if delete_result.deleted_count == 0:
         raise NotFoundError(f"Session '{session_id}' non trovata.")
-    logger.info("Session eliminata: %s (con %d risultati a cascata)", session_id, deleted_results)
+
+    # Il log su file segue la stessa cascata dei Result, e per la stessa
+    # ragione: `GET /api/sessions/{id}/log` richiede che la sessione esista,
+    # quindi un log che le sopravvivesse non sarebbe più leggibile da nessuno —
+    # solo spazio occupato. Viene cancellato **dopo** la sessione, perché è
+    # l'unico passo che non ha bisogno di essere ripetibile.
+    deleted_log = session_logging.delete_session_log(session_id)
+    logger.info(
+        "Session eliminata: %s (con %d risultati a cascata, log su file: %s)",
+        session_id,
+        deleted_results,
+        "rimosso" if deleted_log else "assente",
+    )
+
+
+async def get_session_log(session_id: str) -> str:
+    """Restituisce il log su file prodotto dall'esecuzione di una sessione.
+
+    Riceve:
+        session_id: identificativo della sessione.
+
+    Restituisce:
+        Il contenuto testuale di ``logs/sessions/{sessionId}.log``.
+
+    Fa:
+        Verifica **prima** che la sessione esista, così un id inesistente
+        produce il ``404`` della sessione e non quello, fuorviante, del log
+        mancante. Solleva poi ``NotFoundError`` se il file non c'è: una
+        sessione creata ma mai avviata non ha ancora un log, e questo è un
+        esito normale da comunicare in modo pulito, non un errore interno.
+
+        Il file resta leggibile anche a sessione conclusa, ``completed`` o
+        ``failed`` che sia: ``session_log_context`` chiude lo stream di
+        scrittura ma non rimuove nulla (§5.10). Viene invece riscritto da capo
+        se la stessa sessione viene rilanciata, coerentemente con la
+        cancellazione dei ``Result`` della run precedente.
+    """
+    await get_session(session_id)
+
+    try:
+        content = session_logging.read_session_log(session_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    except OSError as exc:
+        raise DatabaseError(f"Impossibile leggere il log della sessione: {exc}") from exc
+
+    if content is None:
+        raise NotFoundError(
+            f"Nessun log disponibile per la sessione '{session_id}': "
+            "non è mai stata avviata, oppure l'esecuzione non ha ancora scritto nulla."
+        )
+    return content
 
 
 async def set_status(session_id: str, status: RunStatus) -> None:

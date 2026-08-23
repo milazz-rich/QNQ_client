@@ -16,6 +16,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
+from app.core import session_logging
 from app.core.config import settings
 from app.core.errors import AppError
 from app.models.result import ResultCreate, ResultStatus
@@ -48,22 +49,32 @@ async def start_session(session_id: str) -> None:
         ``_run_items`` possa riportare l'esito reale è trattata come
         ``failed``, non ``completed``, perché non c'è garanzia che gli item
         siano stati eseguiti correttamente.
+
+        L'intera esecuzione gira dentro ``session_logging.session_log_context``:
+        tutto ciò che viene loggato qui dentro — da questo modulo, da
+        ``measurement.runner`` e dai tre client di misura — finisce anche in
+        ``logs/sessions/{sessionId}.log`` (§5.10). Il contesto avvolge anche il
+        ``finally``, così la riga di esito finale è l'ultima del file invece di
+        restare fuori dalla cattura.
     """
-    logger.info("Avvio esecuzione sessione %s", session_id)
-    all_items_succeeded = False
-    try:
-        session = await sessions_service.get_session(session_id)
-        await sessions_service.set_status(session_id, RunStatus.RUNNING)
-        all_items_succeeded = await _run_items(session)
-    except Exception:
-        logger.exception("Esecuzione della sessione %s interrotta da un errore", session_id)
-    finally:
-        final_status = RunStatus.COMPLETED if all_items_succeeded else RunStatus.FAILED
+    with session_logging.session_log_context(session_id):
+        logger.info("Avvio esecuzione sessione %s", session_id)
+        all_items_succeeded = False
         try:
-            await sessions_service.set_status(session_id, final_status)
-            logger.info("Sessione %s conclusa con stato %s", session_id, final_status.value)
-        except AppError:
-            logger.exception("Impossibile impostare lo stato finale della sessione %s", session_id)
+            session = await sessions_service.get_session(session_id)
+            await sessions_service.set_status(session_id, RunStatus.RUNNING)
+            all_items_succeeded = await _run_items(session)
+        except Exception:
+            logger.exception("Esecuzione della sessione %s interrotta da un errore", session_id)
+        finally:
+            final_status = RunStatus.COMPLETED if all_items_succeeded else RunStatus.FAILED
+            try:
+                await sessions_service.set_status(session_id, final_status)
+                logger.info("Sessione %s conclusa con stato %s", session_id, final_status.value)
+            except AppError:
+                logger.exception(
+                    "Impossibile impostare lo stato finale della sessione %s", session_id
+                )
 
 
 async def _run_items(session: Session) -> bool:

@@ -789,6 +789,18 @@ non deve sapere *quale* motore sta misurando. Aggiungere Chrome è un'operazione
 > toccare router, service CRUD o `session_runner`. L'unico punto in cui i due
 > motori browser divergono è *interno* al rispettivo client (CDP per Chrome,
 > Navigation Timing per Firefox), esattamente come il pattern prevedeva.
+>
+> Una correzione al pattern è però emersa da una review successiva: non tutto
+> ciò che i motori fanno è "interno al client". Le regole su quali navigazioni
+> main-frame automatiche appartengono ancora al documento misurato erano
+> duplicate verbatim in `chrome_client.py` e `firefox_client.py`, e non sono un
+> dettaglio implementativo: sono la definizione di *cosa* viene misurato. Due
+> copie che possono divergere in silenzio farebbero misurare documenti diversi
+> ai due motori, invalidando proprio il confronto che l'applicazione esiste per
+> produrre. Vivono ora in `measurement/navigation.py`. La regola aggiornata è
+> quindi: **ciò che distingue un motore sta nel suo client, ciò che definisce la
+> misura sta in un modulo condiviso** — anche quando oggi c'è un solo
+> chiamante in più.
 
 ---
 

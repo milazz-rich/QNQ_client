@@ -29,13 +29,17 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import urlunsplit
 
 from app.core.config import settings
 from app.models.common import Protocol
+from app.services.measurement import navigation
 from app.services.measurement.curl_client import Measurement, is_http_success
 
 logger = logging.getLogger(__name__)
+
+# Nome del motore nei messaggi d'errore prodotti da ``navigation``.
+_ENGINE = "Firefox"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _FIREFOX_RUNTIME_ROOT = _REPO_ROOT / ".runtime" / "firefox"
@@ -45,6 +49,14 @@ _PROFILE_LOCKS: dict[str, asyncio.Lock] = {}
 _PROFILE_LOCKS_GUARD = asyncio.Lock()
 _NAVIGATION_TIMING_RETRIES = 4
 _NAVIGATION_TIMING_BACKOFFS = (0.05, 0.1, 0.2)
+# Tempo massimo concesso alla chiusura di un browser/context Playwright. Un
+# processo Firefox che non muore non deve poter fermare l'intera sessione:
+# scaduto il margine si prosegue e si libera comunque il profilo temporaneo.
+_BROWSER_CLOSE_TIMEOUT_S = 15.0
+# Tentativi di precondizionamento del profilo e margine, oltre al timeout di
+# navigazione, concesso all'avvio del browser in ciascun tentativo.
+_PROFILE_PREPARATION_ATTEMPTS = 2
+_PROFILE_PREPARATION_GRACE_MS = 30_000
 _MAIN_FRAME_QUIET_MS = 250
 _MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
 _EXECUTION_CONTEXT_DESTROYED = (
@@ -146,24 +158,73 @@ class _PrimingHandler(BaseHTTPRequestHandler):
 
 
 class LocalhostPrimingServer:
-    """Piccolo server HTTP locale usato solo per il priming DataStorage."""
+    """Piccolo server HTTP locale usato solo per il priming DataStorage.
+
+    Il bind è **sempre** su ``127.0.0.1`` con porta ``0``: l'interfaccia di
+    loopback non è raggiungibile da altre macchine, e la porta effimera scelta
+    dal kernel è per costruzione libera, quindi il caso "porta già occupata"
+    non si presenta (a differenza di una porta fissa). Un eventuale errore di
+    bind resta comunque un'eccezione gestita dal chiamante come misura fallita.
+    """
 
     def __init__(self) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _PrimingHandler)
         self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._serving = False
+        self._closed = False
         self.url = f"http://127.0.0.1:{self._server.server_port}/"
 
     def start(self) -> "LocalhostPrimingServer":
-        """Avvia il server locale su una porta dinamica."""
-        self._thread.start()
+        """Avvia il server locale sulla porta effimera già assegnata.
+
+        Riceve:
+            Nulla.
+
+        Restituisce:
+            L'istanza stessa, per permettere ``LocalhostPrimingServer().start()``.
+
+        Fa:
+            Marca il server come "in servizio" **prima** di lanciare il thread:
+            ``close`` deve sapere che ``serve_forever`` è stato avviato anche se
+            il thread non è ancora partito, altrimenti salterebbe lo ``shutdown``
+            lasciando il loop vivo.
+        """
+        self._serving = True
+        try:
+            self._thread.start()
+        except RuntimeError:
+            self._serving = False
+            raise
         return self
 
     def close(self) -> None:
-        """Ferma il server locale e rilascia la porta."""
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=2)
+        """Ferma il server locale e rilascia la porta.
+
+        Riceve:
+            Nulla.
+
+        Restituisce:
+            ``None``.
+
+        Fa:
+            È **idempotente** e sicura anche se ``start`` non è mai stato
+            chiamato: ``BaseServer.shutdown`` attende che ``serve_forever``
+            segnali la propria uscita, quindi invocarla su un server mai avviato
+            bloccherebbe per sempre il session runner. Il socket viene chiuso in
+            ogni caso, così la porta non resta occupata neanche sul percorso in
+            cui l'avvio del thread è fallito.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._serving:
+                self._server.shutdown()
+        finally:
+            self._server.server_close()
+        if self._serving:
+            self._thread.join(timeout=2)
 
 
 class MainFrameNavigationTracker:
@@ -282,15 +343,8 @@ def _content_length(response: Any) -> float | None:
     return size if size >= 0 else None
 
 
-def _split_url(url: str) -> SplitResult:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise ValueError(f"URL non valido per la misura Firefox: {url!r}.")
-    return parsed
-
-
 def _origin_profile(url: str) -> OriginProfile:
-    parsed = _split_url(url)
+    parsed = navigation.split_url(url, _ENGINE)
     host = parsed.hostname.lower()
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     key = f"{parsed.scheme}://{host}:{port}"
@@ -339,8 +393,96 @@ async def _origin_lock(key: str) -> asyncio.Lock:
 
 
 def _remove_tree(path: Path) -> None:
-    with suppress(FileNotFoundError):
-        shutil.rmtree(path)
+    """Cancella una directory di lavoro senza mai propagare errori.
+
+    Riceve:
+        path: la directory da rimuovere.
+
+    Restituisce:
+        ``None``.
+
+    Fa:
+        Viene invocata dai blocchi ``finally`` di cleanup: un permesso negato o
+        un file ancora aperto dal processo Firefox non devono trasformare un
+        fallimento di misura già gestito in un'eccezione che risale al runner.
+        Se la directory sopravvive viene loggata, così una perdita di spazio
+        resta visibile invece di essere silenziosa.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        logger.warning("Directory di lavoro Firefox non cancellata: %s", path)
+
+
+async def _close_quietly(closeable: Any, what: str) -> None:
+    """Chiude una risorsa Playwright senza poter far fallire il cleanup.
+
+    Riceve:
+        closeable: il context o il browser da chiudere; ``None`` è ammesso.
+        what: descrizione della risorsa, usata nel log.
+
+    Restituisce:
+        ``None``.
+
+    Fa:
+        Serve nei blocchi ``finally``, dove un'eccezione — o peggio un
+        ``close()`` che non ritorna mai perché il processo browser è bloccato —
+        impedirebbe l'esecuzione dei cleanup successivi (tipicamente la
+        cancellazione della copia temporanea del profilo). La chiusura è quindi
+        limitata da ``_BROWSER_CLOSE_TIMEOUT_S`` e ogni errore è degradato a
+        warning: il processo Playwright resta comunque figlio del processo
+        applicativo e viene raccolto alla sua uscita.
+    """
+    if closeable is None:
+        return
+    try:
+        await asyncio.wait_for(closeable.close(), timeout=_BROWSER_CLOSE_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning(
+            "Chiusura di %s non conclusa entro %.0fs: si prosegue con il cleanup.",
+            what,
+            _BROWSER_CLOSE_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 - il cleanup non deve mai fallire
+        logger.warning("Chiusura di %s non riuscita: %s", what, exc)
+
+
+def cleanup_stale_run_profiles() -> int:
+    """Rimuove le copie temporanee di profilo rimaste da esecuzioni precedenti.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        Il numero di directory rimosse.
+
+    Fa:
+        Ogni misura HTTP/3 copia il profilo preparato in
+        ``.runtime/firefox/runs/measure-*`` e la cancella nel proprio
+        ``finally``. Quel ``finally`` non può però girare se il processo
+        applicativo muore di colpo (crash, ``SIGKILL``, riavvio del container):
+        senza una pulizia esplicita quelle copie — decine di MB ciascuna —
+        resterebbero su disco per sempre, senza che nulla le riferisca più.
+
+        Viene invocata **all'avvio** dal lifespan di FastAPI, quando per
+        definizione nessuna misura è in corso: la directory è quindi vuota a
+        ogni avvio pulito. Non tocca ``.runtime/firefox/profiles/``, che
+        contiene i profili preparati riutilizzabili fra un avvio e l'altro.
+    """
+    if not _RUN_PROFILE_ROOT.is_dir():
+        return 0
+
+    removed = 0
+    for entry in _RUN_PROFILE_ROOT.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("measure-"):
+            continue
+        _remove_tree(entry)
+        if not entry.exists():
+            removed += 1
+    if removed:
+        logger.info(
+            "Rimosse %d copie di profilo Firefox rimaste da esecuzioni precedenti.", removed
+        )
+    return removed
 
 
 def _copy_prepared_profile(prepared_profile: Path) -> Path:
@@ -367,62 +509,21 @@ async def _navigate(page: Any, url: str, timeout_ms: int) -> tuple[int, dict[str
     return response.status, timing, response
 
 
-def _failed_with_response(error: str, response_code: int) -> Measurement:
-    return Measurement(
-        succeeded=False,
-        actual_proto=None,
-        total_ms=0.0,
-        ttfb_ms=0.0,
-        kb=0.0,
-        response_code=response_code,
-        error=error,
-    )
-
-
 def _is_execution_context_destroyed(exc: Exception) -> bool:
     return _EXECUTION_CONTEXT_DESTROYED in str(exc)
 
 
-def _default_port(scheme: str) -> int:
-    return 443 if scheme == "https" else 80
-
-
-def _same_origin(first: SplitResult, second: SplitResult) -> bool:
-    return (
-        first.scheme == second.scheme
-        and (first.hostname or "").lower() == (second.hostname or "").lower()
-        and (first.port or _default_port(first.scheme))
-        == (second.port or _default_port(second.scheme))
-    )
-
-
-def _allowed_path_prefix(target_path: str) -> str:
-    if not target_path or target_path == "/":
-        return "/"
-    if target_path.endswith("/"):
-        return target_path
-    return target_path.rsplit("/", 1)[0] + "/"
-
-
 def _is_allowed_internal_navigation(target_url: str, candidate_url: str) -> bool:
-    target = _split_url(target_url)
-    candidate = _split_url(candidate_url)
-    if not _same_origin(target, candidate):
-        return False
-    return candidate.path.startswith(_allowed_path_prefix(target.path))
+    return navigation.is_allowed_internal_navigation(target_url, candidate_url, _ENGINE)
 
 
 def _validate_navigation_chain(target_url: str, urls: list[str]) -> None:
-    for navigated_url in urls:
-        try:
-            allowed = _is_allowed_internal_navigation(target_url, navigated_url)
-        except ValueError:
-            allowed = False
-        if not allowed:
-            raise ExternalMainFrameNavigationError(
-                "Navigazione principale fuori dal contenuto QNQ misurato: "
-                f"{navigated_url}."
-            )
+    disallowed = navigation.find_disallowed_navigation(target_url, urls, _ENGINE)
+    if disallowed is not None:
+        raise ExternalMainFrameNavigationError(
+            "Navigazione principale fuori dal contenuto QNQ misurato: "
+            f"{disallowed}."
+        )
 
 
 async def _wait_for_main_frame_quiet(
@@ -551,6 +652,32 @@ async def _navigate_and_read_final_document(
     )
 
 
+def _preparation_budget_s(timeout_ms: int) -> float:
+    """Calcola il tempo massimo concesso all'intero precondizionamento.
+
+    Riceve:
+        timeout_ms: il timeout di navigazione della ``Session``.
+
+    Restituisce:
+        Il budget complessivo in secondi.
+
+    Fa:
+        Il precondizionamento fa fino a ``_PROFILE_PREPARATION_ATTEMPTS``
+        tentativi, ciascuno con avvio di un browser persistente e fino a due
+        navigazioni non misurate: il budget somma quei contributi più un
+        margine per l'avvio. Serve perché il lock per-origin è tenuto per tutta
+        la preparazione: senza un limite, un target che accetta la connessione
+        ma non risponde mai, o un processo Firefox che non termina, bloccherebbe
+        a tempo indefinito ogni misura HTTP/3 su quella origin. Il lock è un
+        ``asyncio.Lock`` rilasciato dall'``async with`` anche in caso di
+        cancellazione, quindi allo scadere del budget la preparazione viene
+        annullata e l'origin torna disponibile: non è un deadlock, ma senza
+        limite sarebbe comunque un blocco senza uscita.
+    """
+    per_attempt_ms = 2 * timeout_ms + _PROFILE_PREPARATION_GRACE_MS
+    return (_PROFILE_PREPARATION_ATTEMPTS * per_attempt_ms) / 1000
+
+
 async def _ensure_http3_profile(playwright: Any, url: str, timeout_ms: int) -> OriginProfile:
     origin = _origin_profile(url)
     lock = await _origin_lock(origin.key)
@@ -564,7 +691,7 @@ async def _ensure_http3_profile(playwright: Any, url: str, timeout_ms: int) -> O
         prep_urls = _preparation_urls(url, origin)
         last_error = "Alt-Svc HTTP/3 non rilevato durante il precondizionamento."
 
-        for attempt in range(2):
+        for attempt in range(_PROFILE_PREPARATION_ATTEMPTS):
             context = None
             try:
                 context = await playwright.firefox.launch_persistent_context(
@@ -597,8 +724,7 @@ async def _ensure_http3_profile(playwright: Any, url: str, timeout_ms: int) -> O
                 last_error = f"Precondizionamento Firefox fallito per {origin.key}: {exc}"
                 logger.warning(last_error)
             finally:
-                if context is not None:
-                    await context.close()
+                await _close_quietly(context, "browser di precondizionamento Firefox")
 
             await asyncio.sleep(0.25)
             if _profile_contains_h3_altsvc(origin.directory, origin):
@@ -613,21 +739,20 @@ async def _measure_http2(playwright: Any, url: str, timeout_ms: int) -> Measurem
         headless=True,
         firefox_user_prefs=build_user_prefs(Protocol.HTTP2),
     )
+    context = None
     try:
         context = await browser.new_context(ignore_https_errors=True)
+        page = await context.new_page()
+        tracker = MainFrameNavigationTracker(page)
         try:
-            page = await context.new_page()
-            tracker = MainFrameNavigationTracker(page)
-            try:
-                snapshot = await _navigate_and_read_final_document(
-                    page, tracker, url, timeout_ms
-                )
-            except NavigationTimingError as exc:
-                return _failed_with_response(str(exc), 0)
-        finally:
-            await context.close()
+            snapshot = await _navigate_and_read_final_document(page, tracker, url, timeout_ms)
+        except NavigationTimingError as exc:
+            return _failed(str(exc))
     finally:
-        await browser.close()
+        # Cleanup indipendenti: la chiusura del context non deve poter impedire
+        # quella del processo browser, che è la risorsa costosa da rilasciare.
+        await _close_quietly(context, "context Firefox HTTP/2")
+        await _close_quietly(browser, "processo Firefox HTTP/2")
 
     if snapshot.status == 0:
         return _failed("Nessuna risposta ricevuta dal server.")
@@ -653,7 +778,17 @@ async def _prime_datastorage(page: Any, timeout_ms: int) -> None:
 
 
 async def _measure_http3(playwright: Any, url: str, timeout_ms: int) -> Measurement:
-    origin = await _ensure_http3_profile(playwright, url, timeout_ms)
+    budget_s = _preparation_budget_s(timeout_ms)
+    try:
+        origin = await asyncio.wait_for(
+            _ensure_http3_profile(playwright, url, timeout_ms), timeout=budget_s
+        )
+    except TimeoutError:
+        return _failed(
+            "Precondizionamento del profilo Firefox non concluso entro "
+            f"{budget_s:.0f}s: origin non preparata per HTTP/3."
+        )
+
     run_profile = _copy_prepared_profile(origin.directory)
     context = None
     try:
@@ -672,10 +807,16 @@ async def _measure_http3(playwright: Any, url: str, timeout_ms: int) -> Measurem
                 page, tracker, url, timeout_ms
             )
         except NavigationTimingError as exc:
-            return _failed_with_response(str(exc), 0)
+            return _failed(str(exc))
     finally:
-        if context is not None:
-            await context.close()
+        # I due cleanup sono deliberatamente indipendenti: se la chiusura del
+        # processo Firefox fallisce o si blocca, la copia temporanea del profilo
+        # va cancellata **comunque**, altrimenti ogni misura fallita in modo
+        # anomalo lascerebbe decine di MB in `.runtime/firefox/runs/`.
+        # ``_close_quietly`` non solleva mai, quindi la riga successiva è
+        # raggiungibile su ogni percorso di uscita — successo, misura fallita,
+        # eccezione o cancellazione del task.
+        await _close_quietly(context, "processo Firefox di misura HTTP/3")
         _remove_tree(run_profile)
 
     if snapshot.status == 0:

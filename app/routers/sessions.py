@@ -5,6 +5,7 @@ lascia che le eccezioni applicative vengano tradotte dagli handler centralizzati
 """
 
 from fastapi import APIRouter, BackgroundTasks, Path, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.core.errors import ConflictError
@@ -135,6 +136,48 @@ async def start_session(
 
     return SessionStartResponse(
         id=session_id, status=RunStatus.RUNNING, items=len(session.items)
+    )
+
+
+@router.get(
+    "/{session_id}/log",
+    response_class=PlainTextResponse,
+    summary="Scarica il log di esecuzione di una sessione",
+    responses={
+        200: {
+            "content": {"text/plain": {}},
+            "description": "Log di esecuzione della sessione, in testo semplice",
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Sessione inesistente, oppure mai avviata (nessun log)",
+        },
+    },
+)
+async def get_session_log(session_id: str = _SessionId) -> PlainTextResponse:
+    """Restituisce il log prodotto dall'esecuzione di una sessione.
+
+    Riceve:
+        session_id: identificativo della sessione, dal path.
+
+    Restituisce:
+        ``200`` con il contenuto del log come ``text/plain``, oppure ``404`` se
+        la sessione non esiste o non è mai stata avviata.
+
+    Fa:
+        Delega a ``sessions_service.get_session_log``. È l'unica rotta che non
+        restituisce JSON: il log è testo e va poter essere letto direttamente
+        nel browser o salvato con ``curl -o``, non incapsulato in un envelope
+        che andrebbe poi de-escapato per essere leggibile.
+
+        Il ``Content-Disposition`` è ``inline`` con un nome di file
+        suggerito: apre in finestra ma resta salvabile con un nome sensato
+        (``{sessionId}.log``) invece che come "log".
+    """
+    content = await sessions_service.get_session_log(session_id)
+    return PlainTextResponse(
+        content,
+        headers={"Content-Disposition": f'inline; filename="{session_id}.log"'},
     )
 
 

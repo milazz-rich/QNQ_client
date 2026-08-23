@@ -9,7 +9,9 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.core.cors import setup_cors
 from app.core.errors import register_exception_handlers
+from app.core.session_logging import LOG_FORMAT, setup_session_logging
 from app.db.mongo import close_mongo_connection, connect_to_mongo, ensure_indexes
+from app.services.measurement.firefox_client import cleanup_stale_run_profiles
 from app.routers import (
     clients,
     health,
@@ -20,10 +22,7 @@ from app.routers import (
     targets,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 
@@ -38,12 +37,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         Un async context manager che cede il controllo mentre l'app è in esecuzione.
 
     Fa:
-        All'avvio apre la connessione a MongoDB e verifica gli indici della
+        All'avvio apre la connessione a MongoDB, verifica gli indici della
         collezione ``results`` (operazione idempotente, vedi
-        ``ensure_indexes``), allo spegnimento chiude la connessione.
+        ``ensure_indexes``), installa l'handler che cattura su file i log di
+        ogni sessione (§5.10) e rimuove le copie temporanee di profilo Firefox
+        rimaste da un'esecuzione interrotta bruscamente (§5.7): all'avvio
+        nessuna misura è in corso, quindi tutto ciò che resta in
+        ``.runtime/firefox/runs/`` è per definizione un residuo. Allo
+        spegnimento chiude la connessione.
     """
     await connect_to_mongo()
     await ensure_indexes()
+    setup_session_logging()
+    cleanup_stale_run_profiles()
     yield
     await close_mongo_connection()
 

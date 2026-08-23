@@ -38,7 +38,8 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
     ├── core/
     │   ├── config.py          # Settings da .env (pydantic-settings)
     │   ├── cors.py            # configurazione CORS
-    │   └── errors.py          # eccezioni applicative + exception handlers
+    │   ├── errors.py          # eccezioni applicative + exception handlers
+    │   └── session_logging.py # cattura su file dei log per sessione (§5.10)
     ├── db/
     │   ├── mongo.py           # ciclo di vita della connessione motor + indici
     │   └── collections.py     # nomi delle collezioni (costanti)
@@ -73,10 +74,16 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
         │   ├── curl_client.py   # motore "curl": processo esterno + parsing -w
         │   ├── chrome_client.py # motore "chrome": Playwright + CDP
         │   ├── firefox_client.py # motore "firefox": Playwright + Resource Timing
+        │   ├── navigation.py    # regole di catena main-frame, condivise fra i browser
         │   └── runner.py        # entità del dominio → motore → Result
         └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
-└── tests/
-    └── test_firefox_client.py # test unitari del client Firefox
+├── tests/
+│   ├── test_chrome_client.py       # test unitari del client Chrome
+│   ├── test_firefox_client.py      # test unitari del client Firefox
+│   ├── test_measurement_cleanup.py # garanzie di cleanup e coerenza fra motori
+│   └── test_session_logging.py     # correlazione e isolamento dei log di sessione
+├── .runtime/                  # profili Firefox (NON versionato, §5.7)
+└── logs/sessions/             # un file di log per sessione (NON versionato, §5.10)
 ```
 
 > **Nota sulla struttura di `measurement/`.** Una prima stesura di questo
@@ -89,6 +96,16 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
 > motore, senza sapere come questo lavori). I motori espongono lo stesso
 > contratto `measure(url, protocol, timeout_ms) -> Measurement` e sono
 > registrati in `runner.MEASUREMENT_BACKENDS`.
+>
+> `navigation.py` è l'eccezione a "un file per motore": contiene le regole con
+> cui Chrome e Firefox decidono quali navigazioni main-frame automatiche
+> appartengono ancora al documento misurato (§5.6, §5.7). Erano duplicate
+> verbatim nei due client; vivono in un modulo condiviso perché **devono**
+> restare identiche — due motori che accettassero catene di navigazione diverse
+> misurerebbero documenti diversi, e il confronto fra motori perderebbe
+> significato senza che nulla lo segnali. Ogni client conserva la propria
+> eccezione di dominio, perché il messaggio finisce in `Result.error` e deve
+> nominare il motore che ha rifiutato la misura.
 
 ### Regola di stratificazione
 
@@ -108,7 +125,8 @@ Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
 `POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
 lettura filtrata e paginata di `results` (§5.8) con endpoint di aggregazione
-(§5.9), il session runner in background e **tre motori di misura**: `curl`
+(§5.9), il session runner in background con log su file per sessione
+(`GET /sessions/{id}/log`, §5.10) e **tre motori di misura**: `curl`
 (§5.2), `chrome` (§5.6) e `firefox` (§5.7).
 
 Non ancora implementato: client diversi da quelli registrati in
@@ -706,12 +724,14 @@ gestite: è usato dagli health probe.
 POST /api/sessions/{id}/start
   → status = running, risposta 202 immediata
   → BackgroundTask: session_runner.start_session
+      apre la cattura dei log su logs/sessions/{sessionId}.log   (§5.10)
       per ogni item (in SEQUENZA):
         currentIndex = i, item.status = running, item.total = Session.reps
         risolve Target / Scenario / Client   (measurement.runner.resolve_context)
         cancella i Result di una precedente run DI QUESTA sessione (sessionId+item)
         per ogni ripetizione:
-          curl → Result (con sessionId = questa sessione) salvato → item.done += 1
+          motore (curl | chrome | firefox) → Result (con sessionId = questa
+            sessione) salvato → item.done += 1
           attesa fissa di MEASUREMENT_DELAY_MS prima della ripetizione successiva
         item.status = completed SE tutte le ripetizioni hanno prodotto Result "completed"
         item.status = failed    SE almeno una ripetizione ha prodotto Result "failed"
@@ -903,13 +923,20 @@ la coerenza è garantita dall'**ordine**, non da una transazione. La cancellazio
 avviene in `sessions_service.delete_session` in due passi:
 
 1. `delete_many` dei `Result` con quel `sessionId`;
-2. `delete_one` della sessione (→ `404 NOT_FOUND` se non esisteva).
+2. `delete_one` della sessione (→ `404 NOT_FOUND` se non esisteva);
+3. `unlink` del file `logs/sessions/{sessionId}.log`, se presente (§5.10).
 
 I risultati sono cancellati **prima** della sessione di proposito: se il passo 2
 fallisce, la sessione resta e l'operazione è ripetibile; l'ordine inverso
 lascerebbe `Result` orfani non più raggiungibili. Nel caso normale di sessione
 inesistente non esistono risultati con quel `sessionId`, quindi il passo 1 è un
 no-op e il `404` è sollevato correttamente dal passo 2.
+
+Il log è invece cancellato **dopo** la sessione, ed è l'unico passo che non ha
+bisogno di essere ripetibile: `GET /api/sessions/{id}/log` richiede che la
+sessione esista, quindi un file che le sopravvivesse non sarebbe più leggibile
+da nessuno — solo spazio occupato. Un errore di filesystem qui non fa fallire la
+cancellazione (già avvenuta): viene loggato e basta.
 
 > Nota: la pulizia pre-run in `session_runner` (§5.1, "cancella i Result di una
 > precedente run") usa lo stesso principio ma con filtro `sessionId`+`sessionItemId`,
@@ -1187,9 +1214,15 @@ Per ogni misura HTTP/3 reale il client:
 6. naviga una sola volta verso il target QNQ;
 7. chiude Firefox e cancella la copia temporanea del profilo.
 
-Il server localhost risponde solo `200 ok`, non usa HTTPS, non restituisce
-`Alt-Svc`, non usa HTTP/3, non condivide hostname o certificati con QNQ e viene
-sempre chiuso in `finally`. Questa richiesta non viene misurata: i valori
+Il server localhost è vincolato a `127.0.0.1` con **porta effimera** (`bind` su
+porta `0`): non è raggiungibile da altre interfacce, e la porta la sceglie il
+kernel fra quelle libere, quindi il conflitto "porta già occupata" non può
+presentarsi — a differenza di una porta fissa. Risponde solo `200 ok`, non usa
+HTTPS, non restituisce `Alt-Svc`, non usa HTTP/3, non condivide hostname o
+certificati con QNQ e viene sempre chiuso in `finally`. `close()` è idempotente
+e sicura anche se il thread non è mai partito: `BaseServer.shutdown()` attende
+che `serve_forever` segnali la propria uscita, quindi invocarla su un server mai
+avviato bloccherebbe il session runner per sempre. Questa richiesta non viene misurata: i valori
 `total`, `ttfb` e `kb` vengono letti solo dalla navigazione successiva verso il
 target. La validazione sperimentale su questa build ha mostrato che il priming
 locale non contatta `milaz.it`, non apre connessioni verso le porte QNQ, non
@@ -1201,6 +1234,53 @@ profilo, non ci sono connessioni QNQ attive da riusare fra ripetizioni. I log
 Mozilla raccolti durante la validazione hanno mostrato assenza di connessioni
 attive preesistenti, creazione `DnsAndConnectSocket`, ALPN `h3`,
 `Http3Session::Init` e dispatch `isHttp3=1` dopo l'inizio della misura.
+
+#### Cleanup delle risorse: garanzie e limiti
+
+Firefox è il motore con più stato da rilasciare — un processo browser, un
+server locale e una copia di profilo da decine di MB per **ogni** misura HTTP/3
+— quindi il cleanup non può dipendere dal percorso di successo.
+
+| Risorsa | Rilascio | Garantito anche su |
+| ------- | -------- | ------------------ |
+| processo Firefox (misura) | `_close_quietly` nel `finally` di `_measure_http3` | timeout, eccezione di navigazione, crash del browser |
+| copia profilo `runs/measure-*` | `_remove_tree` nello **stesso** `finally`, dopo la chiusura | chiusura del browser fallita o bloccata |
+| server HTTP locale | `finally` di `_prime_datastorage` | fallimento della navigazione di priming |
+| browser di precondizionamento | `_close_quietly` nel `finally` di ogni tentativo | eccezione dentro il tentativo |
+
+Il dettaglio che rende la tabella vera è che i due cleanup di `_measure_http3`
+sono **indipendenti**. Scrivere `await context.close()` seguito da
+`_remove_tree(...)` nello stesso blocco sembra corretto ma non lo è: se la
+chiusura solleva — un processo Firefox già morto, o Playwright che non risponde
+— l'eccezione salta la riga successiva e la copia del profilo resta su disco
+per sempre. `_close_quietly` degrada quindi *qualunque* errore a warning e
+limita l'attesa a `_BROWSER_CLOSE_TIMEOUT_S` (15 s): un browser che non muore
+non deve poter fermare l'intera sessione, e allo scadere si prosegue comunque
+con la cancellazione del profilo. Il processo Playwright resta figlio del
+processo applicativo e viene raccolto alla sua uscita.
+
+**Directory orfane da crash del processo.** Quel `finally` non può girare se il
+processo applicativo muore di colpo (`SIGKILL`, crash, riavvio del container):
+la copia di profilo in uso resterebbe su disco senza che nulla la riferisca più.
+Non è risolvibile dall'interno della misura, quindi è risolto **all'avvio**:
+`firefox_client.cleanup_stale_run_profiles()`, invocata dal lifespan di
+`app/main.py`, rimuove ogni `runs/measure-*` residuo. All'avvio nessuna misura è
+in corso per definizione, quindi tutto ciò che si trova lì è per definizione un
+residuo: `.runtime/firefox/runs/` è vuota a ogni avvio pulito del server. La
+pulizia non tocca `.runtime/firefox/profiles/`, che contiene i profili preparati
+e riutilizzabili fra un avvio e l'altro.
+
+**Timeout sul precondizionamento.** Il lock per-origin è tenuto per *tutta* la
+preparazione del profilo, non solo per la scrittura: senza un limite, un target
+che accetta la connessione ma non risponde mai — o un processo Firefox che non
+termina — bloccherebbe a tempo indefinito ogni misura HTTP/3 su quella origin.
+`_ensure_http3_profile` è quindi avvolto in un `asyncio.wait_for` con budget
+`_PROFILE_PREPARATION_ATTEMPTS × (2 × timeout + 30 s)`, derivato dal timeout
+della `Session`. Non è un deadlock che si evita — il lock è un `asyncio.Lock`,
+rilasciato dall'`async with` anche in caso di cancellazione — ma un blocco senza
+uscita: scaduto il budget la preparazione viene annullata, l'origin torna
+disponibile e la misura fallisce con un messaggio esplicito invece di restare
+appesa.
 
 #### Dati estratti
 
@@ -1320,6 +1400,43 @@ Firefox, protocollo HTTP/3, target Caddy Docker e scenario `/` e terminata
 `total`/`ttfb`/`kb` positivi.
 
 #### Limitazioni note
+
+**Profili preparati mai invalidati.** `.runtime/firefox/profiles/` cresce di una
+directory per ogni origin (`scheme + host + porta`) mai misurata, e nulla la
+rimuove. Oggi non è un problema di volume: le origin sono i sei endpoint fissi
+dei target, il path dello scenario **non** entra nella chiave, e un rilancio
+riusa il profilo esistente — quindi né le ripetizioni né gli scenari diversi
+possono farne proliferare. Le uniche condizioni che lasciano directory inutili
+sono un cambio di host/porta su un `Target` e la cancellazione di un `Target`:
+il profilo della vecchia origin resta, orfano ma innocuo.
+
+Più insidiosa è la **staleness**: un profilo è considerato pronto se il suo
+`AlternateServices.bin` contiene host e token `h3`, senza data di scadenza. Se
+un endpoint smette di annunciare `Alt-Svc: h3`, il precondizionamento viene
+saltato, la misura negozia HTTP/2 e fallisce con "protocollo negoziato diverso
+da quello richiesto" — correttamente, ma **stabilmente**, perché nulla riporta
+il profilo a uno stato vergine. Il rimedio è manuale e va conosciuto:
+
+```bash
+rm -rf .runtime/firefox/profiles/
+```
+
+Non è automatizzato di proposito. Una riparazione automatica al primo
+fallimento significherebbe rieseguire il precondizionamento dentro una misura
+che sta fallendo, allungandola in modo imprevedibile proprio quando il target è
+in difficoltà — e mascherando, con un secondo tentativo silenzioso, un
+cambiamento reale della configurazione del server che è invece esattamente ciò
+che la misura deve segnalare.
+
+**Prima misura HTTP/3 dopo l'avvio.** Osservato una volta su una singola misura
+subito dopo l'avvio del server: `nextHopProtocol` è risultato `h2` invece di
+`h3`, con la ripetizione successiva e tutte le altre (9/9 su tre sessioni
+consecutive) tornate regolarmente a `h3`. È lo stesso genere di race che il
+priming DataStorage mitiga, non un fallimento sistematico, e la conseguenza è
+comunque un `Result` `failed` — mai una misura sbagliata registrata come valida,
+perché il controllo sul protocollo negoziato interviene prima. Non è stata
+aggiunta alcuna mitigazione: un retry nascosto violerebbe l'invariante di
+connessione a freddo.
 
 Le vecchie strade escluse restano escluse: il nome corretto della pref e
 `network.http.http3.enable` (non `enabled`), le mapping Alt-Svc forzate via pref
@@ -1473,6 +1590,151 @@ memoria esaminando **282** documenti per restituirne 50. Con l'indice che
 include anche le chiavi di ordinamento ne esamina esattamente **50**, senza
 stage di sort. È il caso tipico in cui un indice sui soli campi di filtro non
 basta: se la query ordina, l'ordinamento va fatto entrare nell'indice.
+
+### 5.10 Log di esecuzione per sessione
+
+Ogni esecuzione scrive **tutto** ciò che viene loggato mentre gira in un file
+dedicato, recuperabile in seguito senza doverlo cercare:
+
+```
+logs/sessions/{sessionId}.log
+```
+
+La cartella `logs/` è ignorata da Git, stesso trattamento di `.runtime/`. Il
+nome del file è il solo `sessionId`, senza timestamp né suffissi: è ciò che lo
+rende derivabile: conoscendo la sessione si conosce il file.
+
+#### Perché una `ContextVar` e non un parametro
+
+I log utili durante una sessione non arrivano solo dal `session_runner`: i tre
+motori di misura loggano protocolli scartati, status non 2xx, catene di
+navigazione rifiutate e problemi di browser — ed è proprio quella la parte che
+serve leggere quando una sessione finisce `failed`. Quei moduli però non
+conoscono la sessione in corso, e non devono: passare un `sessionId` fino a ogni
+`logger.warning` significherebbe cambiare la firma di mezzo sottosistema per una
+preoccupazione che non è la sua.
+
+Il meccanismo è quindi in `app/core/session_logging.py`:
+
+1. una `ContextVar` porta il `sessionId` corrente;
+2. `session_log_context(session_id)` la valorizza per la durata
+   dell'esecuzione — `session_runner.start_session` ci avvolge il proprio corpo,
+   `finally` compreso, così la riga di esito finale è l'ultima del file;
+3. un `SessionFileHandler` installato sul logger **radice** (dal lifespan di
+   `app/main.py`) la legge a ogni record e decide su quale file scrivere.
+
+L'handler va sul logger radice, non su quello del runner: solo così cattura
+anche i record dei client, che hanno logger propri
+(`app.services.measurement.*`) e propagano alla radice. Le `ContextVar` sono
+ereditate da ogni coroutine avviata dentro il contesto, quindi la catena
+`session_runner` → `measurement.runner` → client viene correlata senza che
+nessuno di quei moduli sappia di esistere dentro una sessione. Un solo handler
+serve tutte le sessioni: la destinazione non è fissata alla costruzione — come
+sarebbe in un `FileHandler` — ma decisa record per record.
+
+Fuori da una sessione l'handler è **inerte**: i record vengono scartati, quindi
+il normale servizio HTTP non scrive nulla e il log a console resta invariato
+(il file è una destinazione in più, non una sostituzione).
+
+#### Endpoint di lettura
+
+```
+GET /api/sessions/{id}/log   →  200 text/plain  |  404
+```
+
+È l'unica rotta che non restituisce JSON: il log è testo e deve poter essere
+letto nel browser o salvato con `curl -o`, non incapsulato in un envelope da
+de-escapare. Il `Content-Disposition` è `inline` con nome suggerito
+`{sessionId}.log`.
+
+Il `404` distingue due casi, entrambi puliti e con il corpo d'errore standard
+(§4.5): la sessione non esiste (`Session '...' non trovata.`), oppure esiste ma
+non è mai stata avviata (`Nessun log disponibile per la sessione '...'`). La
+sessione viene verificata **prima** del file, così un id inesistente non produce
+il messaggio fuorviante sul log mancante.
+
+#### Garanzie verificate
+
+* **Due sessioni non si mescolano.** Il nome del file deriva dall'id, quindi
+  sessioni diverse hanno file diversi per costruzione. Verificato con tre
+  sessioni consecutive (una per motore): nessun file cita l'id di un'altra.
+* **Il file resta leggibile a sessione conclusa**, `completed` o `failed` che
+  sia: uscendo dal contesto si chiude lo stream *in scrittura*, non si cancella
+  nulla. Un'eccezione dentro l'esecuzione non impedisce la chiusura pulita.
+* **È leggibile anche durante l'esecuzione**: il flush è per riga, non a fine
+  sessione, perché serve a seguire una sessione lunga mentre gira.
+* **Rilanciare la stessa sessione riscrive il log da capo**, coerentemente con
+  `session_runner`, che cancella anche i `Result` della run precedente (§5.1).
+* **L'id non può comporre un path arbitrario**: arriva dall'URL, quindi è
+  validato come ObjectId (24 caratteri esadecimali) prima di diventare un nome
+  di file. Un id malformato non fa comunque fallire l'esecuzione — la sessione
+  gira senza cattura su file, perché perdere il log è meno grave che non
+  misurare.
+* **Un errore di scrittura non fa fallire una misura**: passa da
+  `Handler.handleError` e non risale al codice che ha chiamato `logger.*`.
+
+Esempio di file prodotto da una sessione Firefox in HTTP/3:
+
+```text
+INFO     app.services.session_runner: Avvio esecuzione sessione 6a8b781d…
+INFO     app.services.results_service: Risultati eliminati per la sessione … : 0
+INFO     app.services.session_runner: Item 0: 2 ripetizioni HTTP/3 su https://…:8444/ [docker]
+WARNING  app.services.measurement.firefox_client: Misura scartata, protocollo negoziato diverso dal richiesto (Firefox, richiesto HTTP/3, ottenuto HTTP/2)
+WARNING  app.services.measurement.runner: Misurazione fallita (item=…, idx=0): …
+INFO     app.services.session_runner: Sessione 6a8b781d… conclusa con stato failed
+```
+
+#### Fallimenti di rete a basso livello
+
+Un fallimento "di dominio" (403, protocollo negoziato sbagliato) non è l'unico
+caso da poter diagnosticare a posteriori: anche una connessione rifiutata o un
+timeout di connessione — che non toccano mai `_to_measurement`, perché la
+richiesta non arriva a produrre nessuna risposta da interpretare — devono
+lasciare una traccia leggibile. `Result` non ha un campo `error` (§3.3): sui
+fallimenti conserva solo `status="failed"` e `responseCode=0`, senza alcuna
+spiegazione testuale. Il log di sessione è quindi l'**unico** posto dove il
+motivo di questa classe di fallimento sopravvive.
+
+Verificato empiricamente puntando un `Target` temporaneo su una porta chiusa
+reale (`ERR_CONNECTION_REFUSED`) e su un indirizzo non instradabile
+(timeout di connessione vero, nessun RST), per tutti e tre i motori:
+
+| Motore | Riga nel log di sessione |
+| ------ | ------------------------ |
+| curl | `curl ha fallito: curl: (7) Failed to connect to <host> port <porta> ...` |
+| Chrome | `Misura scartata, navigazione Chrome fallita: net::ERR_CONNECTION_REFUSED` |
+| Firefox | `Misura Firefox fallita: Page.goto: NS_ERROR_CONNECTION_REFUSED` |
+
+In tutti e tre i casi la riga arriva dal logger del client (non solo dalla riga
+generica `measurement.runner: Misurazione fallita (item=..., idx=...): ...`,
+che comunque segue e riporta lo stesso testo), e la riga di `session_runner`
+immediatamente precedente (`Item N: ... su <url> [ambiente]`) fissa host, porta
+e protocollo: il log resta diagnosticabile senza dover riprodurre l'errore, pur
+scoping unico per sessione/client rendendo superfluo ripetere quell'informazione
+su ogni riga di fallimento.
+
+Un gap reale è emerso durante questa verifica ed è stato corretto: Chrome
+catturava l'eccezione di `page.goto()` (`ERR_CONNECTION_REFUSED`,
+`ERR_CONNECTION_TIMED_OUT`, DNS non risolto) in una variabile locale
+(`navigation_error`) **senza mai loggarla**. curl restava comunque leggibile
+per coincidenza (il proprio stderr comincia con `curl:`), Firefox lo era per
+via del proprio blocco `except` esterno — solo Chrome era silenzioso. Corretto
+con `_log_navigation_failure`, chiamata su entrambi i punti in cui
+`navigation_error` finisce in un `Measurement` fallito.
+
+#### Limiti noti
+
+* **Il livello radice resta la soglia effettiva.** Il file contiene ciò che
+  *arriva* alla radice, che `app/main.py` configura a `INFO`. Abbassarlo a
+  `DEBUG` fa finire nel file anche il dettaglio di Playwright, non solo quello
+  dell'applicazione.
+* **I record emessi da thread separati non vengono correlati.** Le `ContextVar`
+  sono per contesto di esecuzione, non globali: l'unico caso attuale è
+  l'handler del server di priming locale di Firefox (§5.7), che logga a `DEBUG`
+  — tracce di servizio, non esiti di misura, e comunque sotto la soglia.
+* **Nessuna rotazione né limite di dimensione.** Un file per sessione, che
+  cresce quanto la sessione. Il volume è governato dalla cancellazione a
+  cascata (§5.5): eliminando una sessione sparisce anche il suo log.
 
 ---
 

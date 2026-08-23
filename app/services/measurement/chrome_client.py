@@ -22,13 +22,17 @@ con la misura del documento principale.
 import asyncio
 import logging
 from typing import Any
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import urlsplit
 
 from app.core.config import settings
 from app.models.common import Protocol
+from app.services.measurement import navigation
 from app.services.measurement.curl_client import Measurement, is_http_success
 
 logger = logging.getLogger(__name__)
+
+# Nome del motore nei messaggi d'errore prodotti da ``navigation``.
+_ENGINE = "Chrome"
 
 # Mappa il valore di ``response.protocol`` del CDP sul Protocol di dominio.
 # Solo h2 e h3 sono misure valide: "http/1.1" e qualunque altro valore restano
@@ -94,6 +98,36 @@ def build_browser_args(protocol: Protocol, url: str) -> list[str]:
     return args
 
 
+def _log_navigation_failure(navigation_error: str | None, error: str) -> None:
+    """Logga un fallimento di navigazione Chrome col nome del motore.
+
+    Riceve:
+        navigation_error: il messaggio catturato da ``page.goto()``, o
+            ``None`` se il fallimento non viene da lì (nessun ``Document``
+            ricevuto pur senza eccezione).
+        error: il messaggio effettivamente registrato nel ``Measurement``.
+
+    Restituisce:
+        ``None``.
+
+    Fa:
+        Un fallimento di rete a basso livello (``ERR_CONNECTION_REFUSED``,
+        ``ERR_CONNECTION_TIMED_OUT``, DNS non risolto, ...) solleva
+        un'eccezione da ``page.goto()`` che veniva catturata **senza alcun
+        log**: l'unica traccia era la riga generica di
+        ``measurement.runner`` (``Misurazione fallita (item=..., idx=...):
+        ...``), che non nomina né il motore né riporta esplicitamente
+        host/porta. Per curl e Firefox questa stessa classe di errore produce
+        comunque una riga col nome del motore — curl perché il proprio
+        stderr inizia con ``curl:``, Firefox perché logga esplicitamente
+        ``Misura Firefox fallita`` — mentre Chrome restava silenzioso,
+        rompendo la coerenza fra i tre client su un caso diagnostico
+        importante quanto un protocollo negoziato male. Logga a `WARNING`,
+        coerentemente con gli altri scarti di questo client.
+    """
+    logger.warning("Misura scartata, navigazione Chrome fallita: %s", navigation_error or error)
+
+
 def _failed(error: str) -> Measurement:
     """Costruisce l'esito di una misurazione fallita.
 
@@ -120,53 +154,17 @@ def _failed(error: str) -> Measurement:
     )
 
 
-def _split_url(url: str) -> SplitResult:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise ValueError(f"URL non valido per la misura Chrome: {url!r}.")
-    return parsed
-
-
-def _default_port(scheme: str) -> int:
-    return 443 if scheme == "https" else 80
-
-
-def _same_origin(first: SplitResult, second: SplitResult) -> bool:
-    return (
-        first.scheme == second.scheme
-        and (first.hostname or "").lower() == (second.hostname or "").lower()
-        and (first.port or _default_port(first.scheme))
-        == (second.port or _default_port(second.scheme))
-    )
-
-
-def _allowed_path_prefix(target_path: str) -> str:
-    if not target_path or target_path == "/":
-        return "/"
-    if target_path.endswith("/"):
-        return target_path
-    return target_path.rsplit("/", 1)[0] + "/"
-
-
 def _is_allowed_internal_navigation(target_url: str, candidate_url: str) -> bool:
-    target = _split_url(target_url)
-    candidate = _split_url(candidate_url)
-    if not _same_origin(target, candidate):
-        return False
-    return candidate.path.startswith(_allowed_path_prefix(target.path))
+    return navigation.is_allowed_internal_navigation(target_url, candidate_url, _ENGINE)
 
 
 def _validate_navigation_chain(target_url: str, urls: list[str]) -> None:
-    for navigated_url in urls:
-        try:
-            allowed = _is_allowed_internal_navigation(target_url, navigated_url)
-        except ValueError:
-            allowed = False
-        if not allowed:
-            raise ChromeNavigationError(
-                "Navigazione principale Chrome fuori dal contenuto QNQ misurato: "
-                f"{navigated_url}."
-            )
+    disallowed = navigation.find_disallowed_navigation(target_url, urls, _ENGINE)
+    if disallowed is not None:
+        raise ChromeNavigationError(
+            "Navigazione principale Chrome fuori dal contenuto QNQ misurato: "
+            f"{disallowed}."
+        )
 
 
 async def _wait_for_main_frame_quiet(
@@ -407,20 +405,29 @@ async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement:
             finally:
                 await browser.close()
     except ChromeNavigationError as exc:
+        # Loggato al pari degli altri scarti del client (protocollo errato,
+        # status non 2xx) e come fa firefox_client sul percorso equivalente:
+        # senza, questo era l'unico fallimento di Chrome visibile solo dal
+        # runner, quindi assente dal log di sessione col nome del motore.
+        logger.warning("Misura scartata, catena di navigazione non valida (Chrome): %s", exc)
         return _failed(str(exc))
     except Exception as exc:  # noqa: BLE001 - avvio browser, libreria mancante, ...
         logger.warning("Avvio o esecuzione di Chromium fallita: %s", exc)
         return _failed(f"Chromium non utilizzabile: {exc}")
 
     if document_response is None:
-        return _failed(navigation_error or "Nessuna risposta di tipo Document ricevuta.")
+        error = navigation_error or "Nessuna risposta di tipo Document ricevuta."
+        _log_navigation_failure(navigation_error, error)
+        return _failed(error)
 
     finished = finished_by_request.get(document_response["requestId"])
     if finished is None:
-        return _failed(
+        error = (
             navigation_error
             or "Caricamento del documento non completato (loadingFinished assente)."
         )
+        _log_navigation_failure(navigation_error, error)
+        return _failed(error)
 
     # Il payload dell'evento contiene i dati della risposta nel sotto-oggetto
     # "response"; i metadati di primo livello (requestId, type, ...) non servono.
