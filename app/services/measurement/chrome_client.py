@@ -22,7 +22,7 @@ con la misura del documento principale.
 import asyncio
 import logging
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from app.core.config import settings
 from app.models.common import Protocol
@@ -44,6 +44,12 @@ _VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
 # ``Network.loadingFinished`` del documento: arriva subito dopo il termine
 # della navigazione, ma non necessariamente prima che ``goto`` ritorni.
 _LOADING_FINISHED_GRACE_MS = 2000
+_MAIN_FRAME_QUIET_MS = 250
+_MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
+
+
+class ChromeNavigationError(RuntimeError):
+    """Indica una catena di navigazione Chrome non misurabile in modo coerente."""
 
 
 def build_browser_args(protocol: Protocol, url: str) -> list[str]:
@@ -112,6 +118,99 @@ def _failed(error: str) -> Measurement:
         response_code=0,
         error=error,
     )
+
+
+def _split_url(url: str) -> SplitResult:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError(f"URL non valido per la misura Chrome: {url!r}.")
+    return parsed
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def _same_origin(first: SplitResult, second: SplitResult) -> bool:
+    return (
+        first.scheme == second.scheme
+        and (first.hostname or "").lower() == (second.hostname or "").lower()
+        and (first.port or _default_port(first.scheme))
+        == (second.port or _default_port(second.scheme))
+    )
+
+
+def _allowed_path_prefix(target_path: str) -> str:
+    if not target_path or target_path == "/":
+        return "/"
+    if target_path.endswith("/"):
+        return target_path
+    return target_path.rsplit("/", 1)[0] + "/"
+
+
+def _is_allowed_internal_navigation(target_url: str, candidate_url: str) -> bool:
+    target = _split_url(target_url)
+    candidate = _split_url(candidate_url)
+    if not _same_origin(target, candidate):
+        return False
+    return candidate.path.startswith(_allowed_path_prefix(target.path))
+
+
+def _validate_navigation_chain(target_url: str, urls: list[str]) -> None:
+    for navigated_url in urls:
+        try:
+            allowed = _is_allowed_internal_navigation(target_url, navigated_url)
+        except ValueError:
+            allowed = False
+        if not allowed:
+            raise ChromeNavigationError(
+                "Navigazione principale Chrome fuori dal contenuto QNQ misurato: "
+                f"{navigated_url}."
+            )
+
+
+async def _wait_for_main_frame_quiet(
+    page: Any,
+    mark: int,
+    main_frame_urls: list[str],
+    target_url: str,
+) -> None:
+    """Attende una finestra bounded di quiete della catena main-frame."""
+    deadline = asyncio.get_running_loop().time() + (_MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000)
+    previous_count = len(main_frame_urls) - mark
+
+    while True:
+        await asyncio.sleep(_MAIN_FRAME_QUIET_MS / 1000)
+        current_count = len(main_frame_urls) - mark
+        _validate_navigation_chain(target_url, main_frame_urls[mark:])
+        if current_count == previous_count:
+            return
+
+        previous_count = current_count
+        remaining_ms = int((deadline - asyncio.get_running_loop().time()) * 1000)
+        if remaining_ms <= 0:
+            raise ChromeNavigationError(
+                "Timeout durante la stabilizzazione della catena main-frame Chrome."
+            )
+        try:
+            await page.wait_for_load_state(
+                settings.chrome_wait_until,
+                timeout=min(remaining_ms, 500),
+            )
+        except Exception:
+            pass
+
+
+def _final_document_response(
+    document_responses: list[dict[str, Any]],
+    target_url: str,
+) -> dict[str, Any] | None:
+    """Seleziona l'ultimo Document CDP ancora interno al contenuto QNQ."""
+    for response in reversed(document_responses):
+        response_url = str((response.get("response") or {}).get("url") or "")
+        if response_url and _is_allowed_internal_navigation(target_url, response_url):
+            return response
+    return None
 
 
 def _to_measurement(response: dict[str, Any], finished: dict[str, Any]) -> Measurement:
@@ -232,22 +331,23 @@ async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement:
         )
 
     document_response: dict[str, Any] | None = None
+    document_responses: list[dict[str, Any]] = []
     finished_by_request: dict[str, dict[str, Any]] = {}
-    document_done = asyncio.Event()
+    finished_events: dict[str, asyncio.Event] = {}
+    main_frame_urls: list[str] = []
 
     def on_response(params: dict[str, Any]) -> None:
-        """Trattiene il primo evento di risposta di tipo ``Document``."""
-        nonlocal document_response
-        if document_response is None and params.get("type") == "Document":
-            document_response = params
+        """Trattiene gli eventi di risposta di tipo ``Document``."""
+        if params.get("type") == "Document":
+            document_responses.append(params)
+            finished_events.setdefault(params["requestId"], asyncio.Event())
             if params["requestId"] in finished_by_request:
-                document_done.set()
+                finished_events[params["requestId"]].set()
 
     def on_finished(params: dict[str, Any]) -> None:
         """Registra la fine del caricamento e sblocca l'attesa del documento."""
         finished_by_request[params["requestId"]] = params
-        if document_response is not None and params["requestId"] == document_response["requestId"]:
-            document_done.set()
+        finished_events.setdefault(params["requestId"], asyncio.Event()).set()
 
     try:
         async with async_playwright() as playwright:
@@ -261,12 +361,19 @@ async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement:
             try:
                 context = await browser.new_context(ignore_https_errors=True)
                 page = await context.new_page()
+                page.on(
+                    "framenavigated",
+                    lambda frame: main_frame_urls.append(str(frame.url))
+                    if frame == page.main_frame
+                    else None,
+                )
                 cdp = await context.new_cdp_session(page)
                 await cdp.send("Network.enable")
                 cdp.on("Network.responseReceived", on_response)
                 cdp.on("Network.loadingFinished", on_finished)
 
                 navigation_error: str | None = None
+                navigation_mark = len(main_frame_urls)
                 try:
                     await page.goto(
                         url,
@@ -276,19 +383,31 @@ async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement:
                 except Exception as exc:  # noqa: BLE001 - tradotto in misura fallita
                     navigation_error = str(exc).splitlines()[0].replace("Page.goto: ", "")
 
-                if document_response is not None:
-                    try:
-                        await asyncio.wait_for(
-                            document_done.wait(),
-                            timeout=_LOADING_FINISHED_GRACE_MS / 1000,
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "Evento loadingFinished non ricevuto entro %d ms (Chrome)",
-                            _LOADING_FINISHED_GRACE_MS,
-                        )
+                if document_responses:
+                    await _wait_for_main_frame_quiet(
+                        page,
+                        navigation_mark,
+                        main_frame_urls,
+                        url,
+                    )
+                    document_response = _final_document_response(document_responses, url)
+                    if document_response is not None:
+                        try:
+                            await asyncio.wait_for(
+                                finished_events.setdefault(
+                                    document_response["requestId"], asyncio.Event()
+                                ).wait(),
+                                timeout=_LOADING_FINISHED_GRACE_MS / 1000,
+                            )
+                        except TimeoutError:
+                            logger.warning(
+                                "Evento loadingFinished non ricevuto entro %d ms (Chrome)",
+                                _LOADING_FINISHED_GRACE_MS,
+                            )
             finally:
                 await browser.close()
+    except ChromeNavigationError as exc:
+        return _failed(str(exc))
     except Exception as exc:  # noqa: BLE001 - avvio browser, libreria mancante, ...
         logger.warning("Avvio o esecuzione di Chromium fallita: %s", exc)
         return _failed(f"Chromium non utilizzabile: {exc}")

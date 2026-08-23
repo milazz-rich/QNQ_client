@@ -1024,8 +1024,16 @@ scambiato per una misura valida.
 
 #### Dati estratti dal CDP
 
-Si filtra l'evento con `type == "Document"`: un browser carica anche le
+Si filtrano gli eventi con `type == "Document"`: un browser carica anche le
 sotto-risorse della pagina, che non vanno confuse con la misura del documento.
+Per i contenuti HTTrack una directory iniziale puo fare meta refresh verso un
+documento interno, ad esempio `/content/discord/` ->
+`/content/discord/discord.com/index.html`. Chrome segue naturalmente questa
+catena; il client mantiene una sola `page.goto()` esplicita verso il path
+configurato, attende una breve stabilizzazione bounded del main frame e usa
+l'ultimo documento interno valido. Sono accettate solo navigazioni nello stesso
+`scheme + host + port` e sotto il prefisso dello scenario richiesto; origin
+esterni o path fuori sottoalbero producono failure.
 
 | Campo `Result` | Origine CDP |
 | -------------- | ----------- |
@@ -1196,20 +1204,81 @@ attive preesistenti, creazione `DnsAndConnectSocket`, ALPN `h3`,
 
 #### Dati estratti
 
-Non esistendo il CDP, il protocollo negoziato e i byte si leggono dalla
-**Navigation Timing** del documento (`performance.getEntriesByType('navigation')[0]`,
-via `page.evaluate`) e i tempi da `response.request.timing` di Playwright:
+Non esistendo il CDP, il protocollo negoziato e i tempi si leggono dalla
+**Navigation Timing** del documento finale
+(`performance.getEntriesByType('navigation')[0]`, via `page.evaluate`).
+La `Response` usata per status e fallback byte è quella della stessa
+navigazione main-frame finale:
 
 | Campo `Result` | Origine |
 | -------------- | ------- |
 | `actualProto`  | `nextHopProtocol` (`h2`/`h3` -> HTTP/2 / HTTP/3) |
-| `ttfb`         | `timing.responseStart` (ms dall'inizio della richiesta) |
-| `total`        | `timing.responseEnd` |
-| `kb`           | `transferSize / 1024` dalla Navigation Timing |
+| `ttfb`         | `NavigationTiming.responseStart` |
+| `total`        | `NavigationTiming.responseEnd` |
+| `kb`           | `transferSize / 1024`; fallback a `encodedBodySize`, poi a `Content-Length` della response finale |
 
-`transferSize` include gli header, come `encodedDataLength` di Chrome, quindi
-non e confrontabile 1:1 con `size_download` di curl. Il confronto dei byte resta
-valido fra protocolli a parita di client, non fra client diversi.
+`transferSize` include gli header, come `encodedDataLength` di Chrome, mentre i
+fallback possono rappresentare solo il corpo dichiarato dal documento. Il
+confronto dei byte resta quindi valido soprattutto fra protocolli a parita di
+client, non come equivalenza 1:1 fra Firefox, Chrome e curl.
+
+#### Navigazioni HTTrack e race durante la lettura Navigation Timing
+
+I contenuti HTTrack possono caricare una directory indice e poi fare una
+navigazione client-side immediata verso il documento mirror effettivo, per
+esempio:
+
+```text
+/content/discord/
+-> /content/discord/discord.com/index.html
+```
+
+Questa e una navigazione reale del **main frame**, non un iframe. Chrome la
+segue naturalmente e il client Chrome production seleziona l'ultimo `Document`
+CDP interno valido della catena. Firefox adotta la stessa semantica del
+documento finale stabile, evitando di mescolare la `Response` del documento
+indice con la Navigation Timing del documento successivo.
+
+Il client Firefox mantiene invariata la metodologia cold-connection:
+
+1. esegue una sola `page.goto()` esplicita verso il path configurato dello
+   scenario;
+2. installa prima della `goto()` un tracker delle sole navigazioni main-frame;
+3. accetta navigazioni automatiche interne solo se restano nello stesso
+   `scheme + host + port` e sotto il prefisso del path scenario richiesto;
+4. rifiuta navigazioni verso origin esterni o fuori dal sottoalbero QNQ
+   misurato;
+5. attende una finestra bounded di stabilizzazione (`250 ms` di quiet, timeout
+   massimo `2500 ms`) per catene HTTrack immediate, incluse piu navigazioni
+   interne consecutive;
+6. usa la response della navigazione main-frame finale per status e fallback
+   byte, e verifica che `NavigationTiming.name` corrisponda allo stesso URL
+   finale;
+7. ritenta solo `page.evaluate()` per il messaggio Playwright specifico
+   `Execution context was destroyed, most likely because of a navigation`;
+8. usa massimo 4 tentativi, con backoff `50/100/200 ms`;
+9. non ritenta mai `page.goto()` verso QNQ.
+
+Il retry e quindi ammesso solo per leggere dati gia prodotti dal documento
+stabile. Se durante la stabilizzazione compare una navigazione esterna, o la
+catena non diventa quiet entro il timeout bounded, la misura resta `failed`;
+meglio un failure esplicito che associare timing e response di documenti diversi.
+
+Verifica finale sugli scenari HTTrack:
+
+| Campione | Esito |
+| -------- | ----- |
+| Discord Caddy Docker/KVM, HTTP/2 e HTTP/3, 10 rep per combinazione | 40/40 completed, `200`, protocollo richiesto |
+| Wikipedia Caddy Docker/KVM, HTTP/2 e HTTP/3, 5 rep per combinazione | 20/20 completed, `200`, protocollo richiesto |
+| GitHub Caddy Docker, HTTP/2 e HTTP/3, 3 rep per protocollo | 6/6 completed dopo stabilizzazione bounded della catena interna |
+| Discord sui sei endpoint HTTP/3, 2 rep ciascuno | 12/12 completed, `HTTP/3`, `200`, `total`/`ttfb`/`kb` validi |
+| session runner reale, Caddy/Firefox/Discord, Docker/KVM e HTTP/2/HTTP/3 | sessione `completed`, 4 `Result` completed con path originale `/content/discord/` |
+
+Questo problema e distinto dal noto `ERR_CERT_VERIFIER_CHANGED` di Chrome
+(§5.6): quello e un errore del network/certificate stack Chromium durante la
+navigazione; qui la navigazione Firefox puo essere gia riuscita, e il rischio e
+la lettura dei timing mentre il main frame HTTrack passa dal documento indice al
+documento interno finale.
 
 #### Criterio di successo
 

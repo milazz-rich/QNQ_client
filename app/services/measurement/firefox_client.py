@@ -43,6 +43,13 @@ _PREPARED_PROFILE_ROOT = _FIREFOX_RUNTIME_ROOT / "profiles"
 _RUN_PROFILE_ROOT = _FIREFOX_RUNTIME_ROOT / "runs"
 _PROFILE_LOCKS: dict[str, asyncio.Lock] = {}
 _PROFILE_LOCKS_GUARD = asyncio.Lock()
+_NAVIGATION_TIMING_RETRIES = 4
+_NAVIGATION_TIMING_BACKOFFS = (0.05, 0.1, 0.2)
+_MAIN_FRAME_QUIET_MS = 250
+_MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
+_EXECUTION_CONTEXT_DESTROYED = (
+    "Execution context was destroyed, most likely because of a navigation"
+)
 
 _VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
     "h2": Protocol.HTTP2,
@@ -53,11 +60,30 @@ _NAVIGATION_ENTRY_JS = """() => {
     const entry = performance.getEntriesByType('navigation')[0];
     if (!entry) return null;
     return {
+        name: entry.name,
         nextHopProtocol: entry.nextHopProtocol,
+        responseStart: entry.responseStart,
+        responseEnd: entry.responseEnd,
         transferSize: entry.transferSize,
         encodedBodySize: entry.encodedBodySize,
     };
 }"""
+
+
+class NavigationTimingError(RuntimeError):
+    """Errore recuperabile solo come misura fallita, non come eccezione al runner."""
+
+
+class AdditionalMainFrameNavigationError(NavigationTimingError):
+    """Indica una nuova navigazione del main frame dopo quella misurata."""
+
+
+class ExternalMainFrameNavigationError(NavigationTimingError):
+    """Indica una navigazione main-frame fuori dal contenuto QNQ misurato."""
+
+
+class MainFrameStabilityTimeoutError(NavigationTimingError):
+    """Indica che la catena main-frame non si e stabilizzata nel tempo massimo."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +95,35 @@ class OriginProfile:
     port: int
     key: str
     directory: Path
+
+
+@dataclass(frozen=True)
+class MainFrameNavigationMark:
+    """Punto della catena main-frame prima della navigazione misurata."""
+
+    navigation_count: int
+    response_count: int
+
+
+@dataclass(frozen=True)
+class MainFrameNavigationRecord:
+    """Response e timing associati a una navigazione del main frame."""
+
+    url: str
+    status: int
+    timing: dict[str, Any]
+    byte_size_hint: float | None = None
+
+
+@dataclass(frozen=True)
+class NavigationSnapshot:
+    """Dati coerenti del documento finale effettivamente misurato."""
+
+    url: str
+    status: int
+    timing: dict[str, Any]
+    entry: dict[str, Any] | None
+    byte_size_hint: float | None = None
 
 
 class _PrimingHandler(BaseHTTPRequestHandler):
@@ -109,6 +164,63 @@ class LocalhostPrimingServer:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=2)
+
+
+class MainFrameNavigationTracker:
+    """Osserva le navigazioni del main frame senza alterare la misura."""
+
+    def __init__(self, page: Any) -> None:
+        self._page = page
+        self._main_navigation_count = 0
+        self._main_navigation_urls: list[str] = []
+        self._main_navigation_responses: list[MainFrameNavigationRecord] = []
+        page.on("framenavigated", self._on_frame_navigated)
+        page.on("response", self._on_response)
+
+    def mark(self) -> MainFrameNavigationMark:
+        """Restituisce il contatore corrente delle navigazioni main-frame."""
+        return MainFrameNavigationMark(
+            navigation_count=self._main_navigation_count,
+            response_count=len(self._main_navigation_responses),
+        )
+
+    def count_since(self, mark: MainFrameNavigationMark) -> int:
+        """Conta le navigazioni main-frame osservate dopo un mark."""
+        return self._main_navigation_count - mark.navigation_count
+
+    def urls_since(self, mark: MainFrameNavigationMark) -> list[str]:
+        """Elenca gli URL main-frame osservati dopo un mark."""
+        return self._main_navigation_urls[mark.navigation_count:]
+
+    def responses_since(self, mark: MainFrameNavigationMark) -> list[MainFrameNavigationRecord]:
+        """Elenca le response main-frame osservate dopo un mark."""
+        return self._main_navigation_responses[mark.response_count:]
+
+    def _on_frame_navigated(self, frame: Any) -> None:
+        if frame == self._page.main_frame:
+            self._main_navigation_count += 1
+            self._main_navigation_urls.append(str(frame.url))
+
+    def _on_response(self, response: Any) -> None:
+        request = response.request
+        try:
+            is_main_navigation = (
+                request.is_navigation_request()
+                and request.frame == self._page.main_frame
+            )
+        except Exception:
+            return
+        if not is_main_navigation:
+            return
+        byte_size_hint = _content_length(response)
+        self._main_navigation_responses.append(
+            MainFrameNavigationRecord(
+                url=str(response.url),
+                status=int(response.status),
+                timing=dict(request.timing),
+                byte_size_hint=byte_size_hint,
+            )
+        )
 
 
 def build_user_prefs(protocol: Protocol) -> dict[str, Any]:
@@ -153,6 +265,21 @@ def _failed(error: str) -> Measurement:
         response_code=0,
         error=error,
     )
+
+
+def _content_length(response: Any) -> float | None:
+    """Legge Content-Length dalla response Playwright, se disponibile e valido."""
+    try:
+        value = response.headers.get("content-length")
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        size = float(value)
+    except ValueError:
+        return None
+    return size if size >= 0 else None
 
 
 def _split_url(url: str) -> SplitResult:
@@ -240,6 +367,190 @@ async def _navigate(page: Any, url: str, timeout_ms: int) -> tuple[int, dict[str
     return response.status, timing, response
 
 
+def _failed_with_response(error: str, response_code: int) -> Measurement:
+    return Measurement(
+        succeeded=False,
+        actual_proto=None,
+        total_ms=0.0,
+        ttfb_ms=0.0,
+        kb=0.0,
+        response_code=response_code,
+        error=error,
+    )
+
+
+def _is_execution_context_destroyed(exc: Exception) -> bool:
+    return _EXECUTION_CONTEXT_DESTROYED in str(exc)
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def _same_origin(first: SplitResult, second: SplitResult) -> bool:
+    return (
+        first.scheme == second.scheme
+        and (first.hostname or "").lower() == (second.hostname or "").lower()
+        and (first.port or _default_port(first.scheme))
+        == (second.port or _default_port(second.scheme))
+    )
+
+
+def _allowed_path_prefix(target_path: str) -> str:
+    if not target_path or target_path == "/":
+        return "/"
+    if target_path.endswith("/"):
+        return target_path
+    return target_path.rsplit("/", 1)[0] + "/"
+
+
+def _is_allowed_internal_navigation(target_url: str, candidate_url: str) -> bool:
+    target = _split_url(target_url)
+    candidate = _split_url(candidate_url)
+    if not _same_origin(target, candidate):
+        return False
+    return candidate.path.startswith(_allowed_path_prefix(target.path))
+
+
+def _validate_navigation_chain(target_url: str, urls: list[str]) -> None:
+    for navigated_url in urls:
+        try:
+            allowed = _is_allowed_internal_navigation(target_url, navigated_url)
+        except ValueError:
+            allowed = False
+        if not allowed:
+            raise ExternalMainFrameNavigationError(
+                "Navigazione principale fuori dal contenuto QNQ misurato: "
+                f"{navigated_url}."
+            )
+
+
+async def _wait_for_main_frame_quiet(
+    page: Any,
+    tracker: Any,
+    mark: MainFrameNavigationMark,
+    target_url: str,
+) -> None:
+    """Attende brevemente che emergano navigazioni main-frame immediate."""
+    deadline = asyncio.get_running_loop().time() + (_MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000)
+    previous_count = tracker.count_since(mark)
+
+    while True:
+        await asyncio.sleep(_MAIN_FRAME_QUIET_MS / 1000)
+        current_count = tracker.count_since(mark)
+        _validate_navigation_chain(target_url, tracker.urls_since(mark))
+        if current_count == previous_count:
+            return
+
+        previous_count = current_count
+        remaining_ms = int((deadline - asyncio.get_running_loop().time()) * 1000)
+        if remaining_ms <= 0:
+            raise MainFrameStabilityTimeoutError(
+                "Timeout durante la stabilizzazione della catena main-frame Firefox."
+            )
+        with suppress(Exception):
+            await page.wait_for_load_state(
+                settings.firefox_wait_until,
+                timeout=min(remaining_ms, 500),
+            )
+
+
+async def _read_navigation_entry(
+    page: Any,
+    tracker: Any,
+    mark: MainFrameNavigationMark,
+    target_url: str,
+) -> dict[str, Any] | None:
+    """Legge Navigation Timing senza confondere documenti diversi."""
+    await _wait_for_main_frame_quiet(page, tracker, mark, target_url)
+
+    last_error: Exception | None = None
+    for attempt in range(_NAVIGATION_TIMING_RETRIES):
+        try:
+            entry = await page.evaluate(_NAVIGATION_ENTRY_JS)
+        except Exception as exc:  # noqa: BLE001 - matching selettivo sotto
+            if not _is_execution_context_destroyed(exc):
+                raise
+
+            last_error = exc
+            await _wait_for_main_frame_quiet(page, tracker, mark, target_url)
+            logger.debug(
+                "Firefox Navigation Timing retry %d/%d: execution context destroyed",
+                attempt + 1,
+                _NAVIGATION_TIMING_RETRIES,
+            )
+            if attempt == _NAVIGATION_TIMING_RETRIES - 1:
+                break
+            await asyncio.sleep(_NAVIGATION_TIMING_BACKOFFS[attempt])
+            continue
+
+        await _wait_for_main_frame_quiet(page, tracker, mark, target_url)
+        return entry
+
+    raise NavigationTimingError(
+        "Navigation Timing Firefox non leggibile dopo retry bounded: "
+        f"{last_error or 'errore sconosciuto'}."
+    )
+
+
+def _final_navigation_record(
+    tracker: Any,
+    mark: MainFrameNavigationMark,
+    fallback_response: Any,
+) -> MainFrameNavigationRecord | None:
+    records = tracker.responses_since(mark)
+    if records:
+        return records[-1]
+    if fallback_response is None:
+        return None
+    return MainFrameNavigationRecord(
+        url=str(fallback_response.url),
+        status=int(fallback_response.status),
+        timing=dict(fallback_response.request.timing),
+        byte_size_hint=_content_length(fallback_response),
+    )
+
+
+def _entry_matches_navigation(entry: dict[str, Any] | None, record: MainFrameNavigationRecord) -> bool:
+    entry_name = str((entry or {}).get("name") or "")
+    return not entry_name or entry_name == record.url
+
+
+async def _navigate_and_read_final_document(
+    page: Any,
+    tracker: MainFrameNavigationTracker,
+    url: str,
+    timeout_ms: int,
+) -> NavigationSnapshot:
+    mark = tracker.mark()
+    response = await page.goto(
+        url,
+        wait_until=settings.firefox_wait_until,
+        timeout=timeout_ms,
+    )
+    if response is None:
+        return NavigationSnapshot(url=url, status=0, timing={}, entry=None)
+
+    await _wait_for_main_frame_quiet(page, tracker, mark, url)
+    record = _final_navigation_record(tracker, mark, response)
+    if record is None:
+        return NavigationSnapshot(url=url, status=0, timing={}, entry=None)
+
+    entry = await _read_navigation_entry(page, tracker, mark, url)
+    if not _entry_matches_navigation(entry, record):
+        raise NavigationTimingError(
+            "Navigation Timing Firefox non coerente con la response finale: "
+            f"entry={entry.get('name') if entry else None}, response={record.url}."
+        )
+    return NavigationSnapshot(
+        url=record.url,
+        status=record.status,
+        timing=record.timing,
+        entry=entry,
+        byte_size_hint=record.byte_size_hint,
+    )
+
+
 async def _ensure_http3_profile(playwright: Any, url: str, timeout_ms: int) -> OriginProfile:
     origin = _origin_profile(url)
     lock = await _origin_lock(origin.key)
@@ -306,18 +617,29 @@ async def _measure_http2(playwright: Any, url: str, timeout_ms: int) -> Measurem
         context = await browser.new_context(ignore_https_errors=True)
         try:
             page = await context.new_page()
-            status, timing, _ = await _navigate(page, url, timeout_ms)
-            entry = await page.evaluate(_NAVIGATION_ENTRY_JS) if status else None
+            tracker = MainFrameNavigationTracker(page)
+            try:
+                snapshot = await _navigate_and_read_final_document(
+                    page, tracker, url, timeout_ms
+                )
+            except NavigationTimingError as exc:
+                return _failed_with_response(str(exc), 0)
         finally:
             await context.close()
     finally:
         await browser.close()
 
-    if status == 0:
+    if snapshot.status == 0:
         return _failed("Nessuna risposta ricevuta dal server.")
-    if entry is None:
+    if snapshot.entry is None:
         return _failed("Navigation Timing non disponibile per il documento.")
-    return _to_measurement(Protocol.HTTP2, status, entry, timing)
+    return _to_measurement(
+        Protocol.HTTP2,
+        snapshot.status,
+        snapshot.entry,
+        snapshot.timing,
+        snapshot.byte_size_hint,
+    )
 
 
 async def _prime_datastorage(page: Any, timeout_ms: int) -> None:
@@ -342,20 +664,31 @@ async def _measure_http3(playwright: Any, url: str, timeout_ms: int) -> Measurem
             firefox_user_prefs=build_user_prefs(Protocol.HTTP3),
         )
         page = await context.new_page()
+        tracker = MainFrameNavigationTracker(page)
         await _prime_datastorage(page, timeout_ms)
 
-        status, timing, _ = await _navigate(page, url, timeout_ms)
-        entry = await page.evaluate(_NAVIGATION_ENTRY_JS) if status else None
+        try:
+            snapshot = await _navigate_and_read_final_document(
+                page, tracker, url, timeout_ms
+            )
+        except NavigationTimingError as exc:
+            return _failed_with_response(str(exc), 0)
     finally:
         if context is not None:
             await context.close()
         _remove_tree(run_profile)
 
-    if status == 0:
+    if snapshot.status == 0:
         return _failed("Nessuna risposta ricevuta dal server.")
-    if entry is None:
+    if snapshot.entry is None:
         return _failed("Navigation Timing non disponibile per il documento.")
-    return _to_measurement(Protocol.HTTP3, status, entry, timing)
+    return _to_measurement(
+        Protocol.HTTP3,
+        snapshot.status,
+        snapshot.entry,
+        snapshot.timing,
+        snapshot.byte_size_hint,
+    )
 
 
 def _to_measurement(
@@ -363,6 +696,7 @@ def _to_measurement(
     status: int,
     entry: dict[str, Any] | None,
     timing: dict[str, Any],
+    byte_size_hint: float | None = None,
 ) -> Measurement:
     """Converte i dati di Navigation/Resource Timing nel modello di dominio."""
     raw_protocol = str((entry or {}).get("nextHopProtocol") or "")
@@ -411,14 +745,17 @@ def _to_measurement(
             error=error,
         )
 
-    ttfb_ms = float(timing.get("responseStart", 0.0) or 0.0)
-    total_ms = float(timing.get("responseEnd", 0.0) or 0.0)
+    ttfb_ms = float((entry or {}).get("responseStart") or timing.get("responseStart", 0.0) or 0.0)
+    total_ms = float((entry or {}).get("responseEnd") or timing.get("responseEnd", 0.0) or 0.0)
+    transfer_size = float((entry or {}).get("transferSize", 0.0) or 0.0)
+    encoded_body_size = float((entry or {}).get("encodedBodySize", 0.0) or 0.0)
+    measured_bytes = transfer_size or encoded_body_size or float(byte_size_hint or 0.0)
     return Measurement(
         succeeded=True,
         actual_proto=negotiated,
         total_ms=max(total_ms, 0.0),
         ttfb_ms=max(ttfb_ms, 0.0),
-        kb=float((entry or {}).get("transferSize", 0.0) or 0.0) / 1024,
+        kb=measured_bytes / 1024,
         response_code=status,
         error=None,
     )
