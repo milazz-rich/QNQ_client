@@ -72,8 +72,11 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
         │   ├── __init__.py
         │   ├── curl_client.py   # motore "curl": processo esterno + parsing -w
         │   ├── chrome_client.py # motore "chrome": Playwright + CDP
+        │   ├── firefox_client.py # motore "firefox": Playwright + Resource Timing
         │   └── runner.py        # entità del dominio → motore → Result
         └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
+└── tests/
+    └── test_firefox_client.py # test unitari del client Firefox
 ```
 
 > **Nota sulla struttura di `measurement/`.** Una prima stesura di questo
@@ -104,12 +107,18 @@ routers/  →  services/  →  db/
 Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
 `POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
-lettura filtrata e paginata di `results` (§5.7) con endpoint di aggregazione
-(§5.8), il session runner in background e **due motori di misura**: `curl`
-(§5.2) e `chrome` (§5.6).
+lettura filtrata e paginata di `results` (§5.8) con endpoint di aggregazione
+(§5.9), il session runner in background e **tre motori di misura**: `curl`
+(§5.2), `chrome` (§5.6) e `firefox` (§5.7).
 
-Non ancora implementato: client diversi da `curl` e `chrome` (es. Firefox), che
-sollevano `NOT_IMPLEMENTED`; interruzione di una sessione già avviata.
+Non ancora implementato: client diversi da quelli registrati in
+`runner.MEASUREMENT_BACKENDS`, che sollevano `NOT_IMPLEMENTED`; interruzione di
+una sessione già avviata.
+
+Nota su `firefox`: il motore production è completo e in servizio per **HTTP/2
+e HTTP/3**. Per HTTP/3 usa un precondizionamento esplicito del profilo Firefox:
+Alt-Svc persistito per origin, inizializzazione DataStorage tramite localhost e
+misura successiva come prima richiesta QNQ del nuovo processo (§5.7).
 
 ---
 
@@ -192,7 +201,7 @@ Percorso/payload da richiedere al target.
 
 `Scenario` **non ha un campo `tag`**: era un'etichetta libera senza un uso
 strutturale (non filtrava, non aggregava — a differenza di `environment`, che
-quel ruolo lo ricopre davvero, vedi §5.8), quindi è stata rimossa dallo schema
+quel ruolo lo ricopre davvero, vedi §5.9), quindi è stata rimossa dallo schema
 invece di restare come metadato morto. I documenti `scenarios` preesistenti
 sono stati aggiornati con un `$unset` idempotente, per lo stesso motivo di
 `extra="forbid"` visto altrove (§3.4): un campo fuori schema nei documenti
@@ -320,7 +329,8 @@ configurazione) — mai dal client HTTP.
 
 **`clientId`.** Stessa logica di `targetId`, applicata al motore di misura:
 riferimento esplicito a `clients._id`, popolato dagli stessi due punti e con lo
-stesso fallback sul `SessionItem`. Esiste perché il confronto **curl vs Chrome**
+stesso fallback sul `SessionItem`. Esiste perché il confronto **fra motori di
+misura** (curl, Chrome, Firefox)
 (§5.6) è una dimensione di analisi di prima classe: senza questa FK andrebbe
 ricostruito risalendo `Result → SessionItem → Client`, con lo stesso rischio di
 matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
@@ -331,7 +341,7 @@ matching ambiguo già visto per il target. È anche il filtro `?clientId=` di
 popolamento. `scenarioPath` resta lo snapshot testuale, ma **non** identifica
 lo scenario: due scenari distinti possono condividere lo stesso path, e un
 path può essere modificato dopo la misura. È la dimensione `scenario`
-dell'aggregazione (§5.8) e il filtro `?scenarioId=` di `GET /api/results`.
+dell'aggregazione (§5.9) e il filtro `?scenarioId=` di `GET /api/results`.
 
 > **Nota di migrazione.** `targetId`, `clientId` e `scenarioId` sono
 > **obbligatori**: i `Result` scritti prima della loro introduzione non li
@@ -405,7 +415,7 @@ Conseguenze:
   `SessionItem` a ogni aggregazione.
 * **La creazione batch** genera ora Scenario × Protocollo × Ambiente (§3.5):
   target e client non sono più nel prodotto perché li fissa la sessione.
-* **L'aggregazione** sostituisce la dimensione `tag` con `environment` (§5.8).
+* **L'aggregazione** sostituisce la dimensione `tag` con `environment` (§5.9).
   Non è una ridenominazione di comodo: `tag` era una stringa libera sul
   `Target`, `environment` è un enum chiuso sul `Result` — niente più `$lookup`,
   niente più valori incoerenti fra righe duplicate.
@@ -597,8 +607,8 @@ Gerarchia in `app/core/errors.py`:
 
 `NotImplementedFeatureError` è deliberatamente distinta da un errore generico:
 serve a dire "il dominio prevede questo caso, il codice non ancora" — oggi vale
-per i client diversi da `curl` e `chrome` (es. Firefox), cioè quelli assenti da
-`runner.MEASUREMENT_BACKENDS`. Il frontend può così spiegare la situazione
+per i client assenti da `runner.MEASUREMENT_BACKENDS`, cioè diversi da `curl`,
+`chrome` e `firefox`. Il frontend può così spiegare la situazione
 all'utente invece di mostrare un errore opaco.
 
 Gli handler sono registrati in `register_exception_handlers(app)` e coprono
@@ -623,6 +633,7 @@ risposta di errore sfugga al formato comune.
 | `CURL_CA_BUNDLE_PATH` | *(vuoto)*                | opzionale, certificato CA custom (`--cacert`) |
 | `CHROME_CERT_SPKI_HASH` | *(vuoto)*              | hash SPKI dei certificati self-signed fidati da Chrome; lista separata da virgole |
 | `CHROME_WAIT_UNTIL`  | `load`                        | `load` \| `commit` \| `domcontentloaded` |
+| `FIREFOX_WAIT_UNTIL` | `load`                        | idem, per il motore Firefox (§5.7) |
 | `MEASUREMENT_DELAY_MS` | `300`                       | pausa fra ripetizioni, uniforme per ogni client/target/protocollo (§5.1) |
 
 Il binario di default è una build custom di curl: quello di sistema in genere
@@ -651,6 +662,12 @@ calcola dal certificato con:
 openssl x509 -in CERT.crt -pubkey -noout | openssl pkey -pubin -outform der \
   | openssl dgst -sha256 -binary | openssl enc -base64
 ```
+
+Il motore Firefox **non ha** un'impostazione corrispondente: il certificato
+self-signed è gestito da `ignore_https_errors` del context Playwright,
+verificato necessario e sufficiente (§5.7). L'unica configurazione Firefox è
+quindi `FIREFOX_WAIT_UNTIL`, con lo stesso significato del corrispettivo
+Chrome.
 
 È modellata come **lista separata da virgole** (stesso trattamento `NoDecode`
 di `CORS_ORIGINS`) anche se oggi contiene un solo valore: ambienti diversi
@@ -728,7 +745,7 @@ frontend su `GET /api/sessions/{id}` di mostrare l'avanzamento in tempo reale.
 riuscita o fallita — `session_runner._run_single_item` attende
 `settings.measurement_delay_ms` (default `300` ms) prima di lanciare la
 successiva. La pausa è **sempre la stessa**, per qualunque combinazione di
-client (curl o Chrome), target e protocollo: non è condizionata al caso
+client (curl, Chrome o Firefox), target e protocollo: non è condizionata al caso
 specifico (es. "solo su OpenLiteSpeed", o "solo se la precedente è fallita"),
 perché differenziarla introdurrebbe una variabile in più fra i dati raccolti
 su target diversi, minando proprio la comparabilità che l'applicazione esiste
@@ -898,7 +915,7 @@ no-op e il `404` è sollevato correttamente dal passo 2.
 > precedente run") usa lo stesso principio ma con filtro `sessionId`+`sessionItemId`,
 > per non cancellare i risultati di altre sessioni al rilancio.
 
-Sul versante lettura vedi §5.7.
+Sul versante lettura vedi §5.8.
 
 ### 5.6 Motore di misura "chrome" (Playwright + CDP)
 
@@ -1060,7 +1077,190 @@ Attenzione: con `load` su pagine molto pesanti il `timeout` della `Session`
 deve essere generoso — è il tempo di caricamento dell'**intera pagina**, non
 della singola richiesta.
 
-### 5.7 Lettura dei risultati: filtri e paginazione
+### 5.7 Motore di misura "firefox" (Playwright + Resource Timing)
+
+Il terzo motore di misura, selezionabile creando un `Client` di nome `Firefox`,
+guida **Firefox headless** via Playwright e legge protocollo/timing dall'API
+cross-browser disponibile anche su Firefox. Espone lo stesso contratto di
+`curl_client` e `chrome_client`:
+
+```python
+async def measure(url: str, protocol: Protocol, timeout_ms: int) -> Measurement
+```
+
+E registrato in `runner.MEASUREMENT_BACKENDS` e produce sempre un `Measurement`
+strutturato: un errore di browser, rete, timeout, protocollo negoziato errato o
+status HTTP non 2xx diventa un `Result` `failed`, non un'eccezione che blocca la
+sessione.
+
+#### Stato production
+
+Firefox e operativo in production sia per **HTTP/2** sia per **HTTP/3** sui
+target QNQ. HTTP/3 richiede una fase di precondizionamento del profilo separata
+dalla misura, perche Firefox non ha un flag equivalente a `curl --http3` o a
+`--origin-to-force-quic-on` di Chrome.
+
+Il principio metodologico e: protocollo noto prima della misura, connessione
+verso il target creata durante la misura. Curl conosce HTTP/3 dal flag
+`--http3`, Chrome lo conosce da `--origin-to-force-quic-on`, Firefox lo conosce
+dall'`Alt-Svc` persistito nel profilo. In tutti e tre i casi la connessione
+verso il target nasce nella misura reale.
+
+#### HTTP/2
+
+Il percorso HTTP/2 resta volutamente semplice: `measure()` avvia un nuovo
+browser Firefox non persistente, crea un context con `ignore_https_errors=True`,
+imposta `network.http.http3.enable=false` e naviga una sola volta verso l'URL
+misurato. Non usa profili persistenti, non fa priming localhost e non prepara
+Alt-Svc. Il controllo finale resta il protocollo effettivamente negoziato:
+richiesta HTTP/2 + `nextHopProtocol="h2"` + status 2xx produce `completed`;
+qualunque altro protocollo produce `failed`.
+
+#### HTTP/3: profilo preparato
+
+Firefox scopre HTTP/3 sui target QNQ tramite l'header `Alt-Svc` del server.
+Questa conoscenza viene persistita nel profilo Firefox in `AlternateServices.bin`,
+ma non e disponibile a un profilo completamente vergine prima della prima
+risposta del target. Il client production gestisce quindi un profilo preparato
+per ogni origin, con chiave derivata da `scheme + host + port`.
+
+I profili persistenti stanno sotto `.runtime/firefox/profiles/`, directory
+ignorata da Git. La directory di ogni origin include anche un digest SHA-256
+della chiave, cosi porte diverse dello stesso hostname non condividono lo stesso
+profilo. L'accesso alla preparazione e protetto da un lock asincrono keyed per
+origin: oggi le misure sono sequenziali, ma due preparazioni future della stessa
+origin non devono poter corrompere il profilo base.
+
+Se `AlternateServices.bin` esiste gia e contiene host e token `h3`, il
+precondizionamento viene saltato. Se manca, Firefox viene avviato con un
+`launch_persistent_context` sul profilo base e viene fatta una navigazione non
+misurata per apprendere l'Alt-Svc. Il client preferisce la root della origin
+(`https://host:port/`) perche e il path piu neutro disponibile; se non produce
+un Alt-Svc h3 utilizzabile, prova l'URL effettivo passato a `measure()`. Questa
+fase e esplicitamente precondizionamento: non alimenta `total`, `ttfb`, `kb` e
+non viene registrata come risultato.
+
+Le preference HTTP/3 production sono solo quelle verificate:
+
+```python
+{
+    "network.http.http3.enable": True,
+    "network.http.http3.disable_when_third_party_roots_found": False,
+    "network.http.http3.enable_0rtt": False,
+    "security.tls.enable_0rtt_data": False,
+    "security.ssl.disable_session_identifiers": True,
+    "browser.cache.disk.enable": False,
+    "browser.cache.memory.enable": False,
+}
+```
+
+`disable_when_third_party_roots_found=false` e necessario con i certificati non
+pubblici dei target QNQ; senza questa preference Firefox puo rifiutare l'upgrade
+a HTTP/3 anche quando Alt-Svc e corretto. Le preference su 0-RTT e session
+identifiers sono state verificate nella build Playwright usata e mantengono la
+misura compatibile con l'invariante cold-connection.
+
+#### HTTP/3: misura e priming DataStorage
+
+Un dettaglio specifico di Firefox rende insufficiente il solo profilo
+persistente: subito dopo l'avvio `AlternateServices.bin` esiste, ma il
+DataStorage Alt-Svc puo non essere ancora pronto. In quel caso Firefox logga
+`storage is not ready` e la prima richiesta QNQ resta HTTP/2. Una semplice
+attesa dopo l'avvio non risolve il problema; il caricamento e lazy e serve
+attivare lo stack HTTP.
+
+Per ogni misura HTTP/3 reale il client:
+
+1. copia il profilo preparato in `.runtime/firefox/runs/measure-*`;
+2. avvia un nuovo processo Firefox con quella copia temporanea;
+3. avvia un piccolo server HTTP/1.1 locale su `127.0.0.1` e porta dinamica;
+4. naviga una volta su localhost per inizializzare HTTP/DataStorage;
+5. chiude il server locale;
+6. naviga una sola volta verso il target QNQ;
+7. chiude Firefox e cancella la copia temporanea del profilo.
+
+Il server localhost risponde solo `200 ok`, non usa HTTPS, non restituisce
+`Alt-Svc`, non usa HTTP/3, non condivide hostname o certificati con QNQ e viene
+sempre chiuso in `finally`. Questa richiesta non viene misurata: i valori
+`total`, `ttfb` e `kb` vengono letti solo dalla navigazione successiva verso il
+target. La validazione sperimentale su questa build ha mostrato che il priming
+locale non contatta `milaz.it`, non apre connessioni verso le porte QNQ, non
+apprende Alt-Svc QNQ e non prepara TLS/QUIC verso il target; serve solo a
+rendere pronto lo storage Firefox.
+
+Poiche ogni misura usa un nuovo processo Firefox e una copia temporanea del
+profilo, non ci sono connessioni QNQ attive da riusare fra ripetizioni. I log
+Mozilla raccolti durante la validazione hanno mostrato assenza di connessioni
+attive preesistenti, creazione `DnsAndConnectSocket`, ALPN `h3`,
+`Http3Session::Init` e dispatch `isHttp3=1` dopo l'inizio della misura.
+
+#### Dati estratti
+
+Non esistendo il CDP, il protocollo negoziato e i byte si leggono dalla
+**Navigation Timing** del documento (`performance.getEntriesByType('navigation')[0]`,
+via `page.evaluate`) e i tempi da `response.request.timing` di Playwright:
+
+| Campo `Result` | Origine |
+| -------------- | ------- |
+| `actualProto`  | `nextHopProtocol` (`h2`/`h3` -> HTTP/2 / HTTP/3) |
+| `ttfb`         | `timing.responseStart` (ms dall'inizio della richiesta) |
+| `total`        | `timing.responseEnd` |
+| `kb`           | `transferSize / 1024` dalla Navigation Timing |
+
+`transferSize` include gli header, come `encodedDataLength` di Chrome, quindi
+non e confrontabile 1:1 con `size_download` di curl. Il confronto dei byte resta
+valido fra protocolli a parita di client, non fra client diversi.
+
+#### Criterio di successo
+
+Il client Firefox dichiara una misura riuscita solo se valgono tutte queste
+condizioni:
+
+| Richiesta | Protocollo negoziato | Status | Esito |
+| --------- | -------------------- | ------ | ----- |
+| HTTP/2 | `h2` | 2xx | `completed` |
+| HTTP/3 | `h3` | 2xx | `completed` |
+| HTTP/3 | `h2` | qualunque | `failed` |
+| qualunque | HTTP/1.1 o sconosciuto | qualunque | `failed` |
+| qualunque | `h2`/`h3` corretto | non 2xx | `failed` |
+
+Questo controllo e piu severo di curl/Chrome perche Firefox non puo forzare il
+protocollo con un flag di processo: una navigazione che termina bene ma negozia
+il protocollo sbagliato non e la misura richiesta.
+
+#### Verifiche production
+
+Il consolidamento production e stato validato con `firefox_client.measure()` e
+con il normale `session_runner`:
+
+| Endpoint QNQ | Esito HTTP/3 production |
+| ------------ | ----------------------- |
+| OpenLiteSpeed Docker `8443` | `HTTP/3`, `200` |
+| Caddy Docker `8444` | `HTTP/3`, `200` |
+| nginx Docker `8445` | `HTTP/3`, `200` |
+| OpenLiteSpeed KVM `9443` | `HTTP/3`, `200` |
+| Caddy KVM `9444` | `HTTP/3`, `200` |
+| nginx KVM `9445` | `HTTP/3`, `200` |
+
+Sono state inoltre eseguite quattro ripetizioni consecutive su Caddy Docker
+`8444`, tutte `HTTP/3` con status `200`, e due misure HTTP/2 di controllo su
+Docker/KVM, entrambe `HTTP/2` con status `200`. Una sessione reale con client
+Firefox, protocollo HTTP/3, target Caddy Docker e scenario `/` e terminata
+`completed` e ha salvato un `Result` con `proto="HTTP/3"`,
+`actualProto="HTTP/3"`, `status="completed"`, `responseCode=200` e valori
+`total`/`ttfb`/`kb` positivi.
+
+#### Limitazioni note
+
+Le vecchie strade escluse restano escluse: il nome corretto della pref e
+`network.http.http3.enable` (non `enabled`), le mapping Alt-Svc forzate via pref
+non rendono utilizzabile la primissima navigazione a freddo, il warm-up verso il
+target nello stesso context non e comparabile perche riusa la connessione, e
+DNS HTTPS/SVCB non e disponibile nell'infrastruttura QNQ corrente. Questi punti
+spiegano perche il client production usa profilo precondizionato e priming
+localhost invece di aggiungere preference casuali o navigazioni QNQ nascoste.
+
+### 5.8 Lettura dei risultati: filtri e paginazione
 
 `GET /api/results` è **l'unica rotta di elenco paginata**, perché è l'unica che
 può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
@@ -1072,12 +1272,12 @@ può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
 | --------- | ----------- |
 | `?sessionId=` | i risultati di **una** esecuzione. Filtro **preferito**: diretto e senza ambiguità |
 | `?sessionItemIds=` | lista comma-separated; mantenuto per compatibilità ma ambiguo (un `SessionItem` può essere condiviso fra sessioni, §3.3) |
-| `?clientId=` | il motore che ha prodotto la misura, per il confronto curl vs Chrome |
+| `?clientId=` | il motore che ha prodotto la misura, per il confronto fra curl, Chrome e Firefox |
 | `?targetId=` | il server sotto test |
 | `?scenarioId=` | lo scenario, per riferimento diretto |
 | `?scenarioPath=` | confronto esatto sul path richiesto; è uno snapshot testuale, `?scenarioId=` è più preciso |
 
-Gli stessi identici filtri valgono per `GET /api/results/aggregate` (§5.8):
+Gli stessi identici filtri valgono per `GET /api/results/aggregate` (§5.9):
 sono costruiti da un'unica funzione condivisa, `results_service.build_filter_query`,
 proprio perché due copie divergerebbero alla prima aggiunta.
 
@@ -1123,7 +1323,7 @@ o saltare documenti.
 > dentro `items`. Il frontend va aggiornato a leggere `items`/`total` e a
 > paginare (o a passare `?pageSize=200` e iterare su `page`).
 
-### 5.8 Aggregazione e indici
+### 5.9 Aggregazione e indici
 
 #### `GET /api/results/aggregate`
 
@@ -1136,7 +1336,7 @@ aggregazione MongoDB (`$match` → eventuale `$lookup` → `$group` → `$sort`)
 | --------- | ------ | ---- |
 | `?groupBy=` | `target` \| `environment` \| `client` \| `scenario` | **obbligatorio** |
 | `?metric=` | `total` \| `ttfb` \| `kb` | default `total` |
-| *filtri* | gli **stessi** di `GET /api/results` (§5.7) | in AND |
+| *filtri* | gli **stessi** di `GET /api/results` (§5.8) | in AND |
 
 Tre proprietà non ovvie, tutte deliberate:
 
@@ -1250,6 +1450,48 @@ Verifica rapida che l'ambiente sia a posto:
 ```bash
 python -c "import asyncio; from app.services.measurement import chrome_client; from app.models.target import Protocol; print(asyncio.run(chrome_client.measure('https://milaz.it:8444/', Protocol.HTTP3, 15000)))"
 ```
+
+### Setup aggiuntivo per il motore "firefox"
+
+Stessa logica di Chrome: `pip install` porta la libreria, non il browser.
+
+```bash
+# scarica il browser (~90 MB in ~/.cache/ms-playwright)
+playwright install firefox
+```
+
+A differenza di Chromium, sul WSL di sviluppo Firefox **non ha richiesto
+librerie di sistema aggiuntive**: `playwright install firefox` è bastato. Se su
+un altro ambiente il browser non si avviasse, vale lo stesso rimedio:
+
+```bash
+sudo playwright install-deps firefox
+```
+
+Come per Chrome, un browser mancante non compromette la sessione: le misure con
+client `Firefox` falliscono in modo pulito (`Result` con `status="failed"` ed
+errore *"Firefox non utilizzabile: …"*).
+
+Verifica rapida del client production — **usare `Protocol.HTTP2`**, non HTTP/3:
+HTTP/3 richiede la fase di precondizionamento descritta in §5.7 e non è ancora
+integrata in `firefox_client.py`.
+
+```bash
+python -c "import asyncio; from app.services.measurement import firefox_client; from app.models.common import Protocol; print(asyncio.run(firefox_client.measure('https://milaz.it:8444/', Protocol.HTTP2, 20000)))"
+```
+
+### Client di misura nel database
+
+Un motore è selezionabile in una `Session` solo se esiste un `Client` con il
+nome corrispondente (confronto case-insensitive contro
+`runner.MEASUREMENT_BACKENDS`). Per aggiungere Firefox:
+
+```bash
+curl -X POST http://localhost:8000/api/clients \
+  -H 'Content-Type: application/json' -d '{"name": "Firefox"}'
+```
+
+I tre `Client` previsti sono quindi `curl`, `Chrome` e `Firefox`.
 
 ---
 

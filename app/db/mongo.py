@@ -78,7 +78,7 @@ async def ensure_indexes() -> None:
         solo più lentamente, e deve poter partire per essere diagnosticata.
 
         Le combinazioni scelte rispecchiano i filtri realmente usati da
-        ``results_service`` (vedi AGENTS.md §5.8).
+        ``results_service`` (vedi AGENTS.md §5.9).
     """
     if _database is None:
         logger.warning("Indici non creati: connessione al database non inizializzata.")

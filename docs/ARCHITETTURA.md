@@ -782,6 +782,14 @@ Il valore del pattern: il `session_runner`, che orchestra l'esecuzione, non sa e
 non deve sapere *quale* motore sta misurando. Aggiungere Chrome è un'operazione
 **additiva** (un file nuovo + un punto di dispatch), non invasiva.
 
+> **Aggiornamento.** Questa sezione è stata scritta quando esisteva il solo
+> motore curl. Il piano è stato poi eseguito due volte — `chrome_client.py`
+> (AGENTS.md §5.6) e `firefox_client.py` (§5.7) — e ha retto in entrambi i
+> casi: un file nuovo più una riga in `runner.MEASUREMENT_BACKENDS`, senza
+> toccare router, service CRUD o `session_runner`. L'unico punto in cui i due
+> motori browser divergono è *interno* al rispettivo client (CDP per Chrome,
+> Navigation Timing per Firefox), esattamente come il pattern prevedeva.
+
 ---
 
 ### Riferimenti incrociati

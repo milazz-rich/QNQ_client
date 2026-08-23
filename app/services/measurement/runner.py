@@ -23,7 +23,7 @@ from app.models.scenario import Scenario
 from app.models.session_item import SessionItem
 from app.models.target import Target, TargetEndpoint
 from app.services import clients_service, scenarios_service, targets_service
-from app.services.measurement import chrome_client, curl_client
+from app.services.measurement import chrome_client, curl_client, firefox_client
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 MEASUREMENT_BACKENDS: dict[str, ModuleType] = {
     "curl": curl_client,
     "chrome": chrome_client,
+    "firefox": firefox_client,
 }
 
 
@@ -62,9 +63,10 @@ class MeasurementContext:
         url: l'URL già composto, costante per tutte le ripetizioni.
         target_label: snapshot leggibile del target, salvato in ogni ``Result``;
             include l'ambiente, perché lo stesso ``Target`` ne serve due.
-        backend: il modulo che esegue materialmente la misura (``curl_client``
-            o ``chrome_client``), già risolto dal nome del ``Client``: le
-            ripetizioni non devono ridecidere quale motore usare.
+        backend: il modulo che esegue materialmente la misura
+            (``curl_client``, ``chrome_client`` o ``firefox_client``), già
+            risolto dal nome del ``Client``: le ripetizioni non devono
+            ridecidere quale motore usare.
     """
 
     session_item: SessionItem
@@ -97,8 +99,8 @@ async def resolve_context(
         Carica ``Target``, ``Scenario`` e ``Client`` dal database — sollevando
         ``NotFoundError`` se uno dei riferimenti è rotto — e risolve il nome del
         client nel motore di misura corrispondente tramite
-        ``MEASUREMENT_BACKENDS``. Un client non presente nella mappa (es.
-        Firefox) solleva ``NotImplementedFeatureError`` (HTTP 501, codice
+        ``MEASUREMENT_BACKENDS``. Un client non presente nella mappa solleva
+        ``NotImplementedFeatureError`` (HTTP 501, codice
         ``NOT_IMPLEMENTED``) invece di un errore generico, così che il frontend
         possa spiegare all'utente che quel motore non è ancora disponibile.
 
@@ -172,8 +174,8 @@ async def measure_once(
         ``completed`` o ``failed``.
 
     Fa:
-        Invoca il motore di misura risolto in ``context.backend`` (curl o
-        Chrome) e traduce l'esito nel
+        Invoca il motore di misura risolto in ``context.backend`` (curl,
+        Chrome o Firefox) e traduce l'esito nel
         modello ``Result``. Un fallimento non solleva eccezioni: produce un
         risultato con ``status="failed"``, tempi a zero e ``actualProto=None``,
         in modo che l'esecuzione della sessione prosegua e il fallimento resti

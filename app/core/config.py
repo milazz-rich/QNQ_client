@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     chrome_cert_spki_hash: Annotated[list[str], NoDecode] = Field(default_factory=list)
     chrome_wait_until: Literal["load", "commit", "domcontentloaded"] = Field(default="load")
 
+    # Firefox non ha l'equivalente di ``CHROME_CERT_SPKI_HASH``: il certificato
+    # self-signed è gestito da ``ignore_https_errors`` del context Playwright,
+    # verificato necessario e sufficiente (§5.7). Resta solo la scelta di cosa
+    # misurare, con lo stesso significato del corrispettivo di Chrome.
+    firefox_wait_until: Literal["load", "commit", "domcontentloaded"] = Field(default="load")
+
     # ``NoDecode`` disattiva il parsing JSON che pydantic-settings applicherebbe
     # ai campi complessi prima dei validator: senza, ``CORS_ORIGINS=http://a``
     # farebbe fallire l'avvio con un JSONDecodeError.

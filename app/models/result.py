@@ -49,7 +49,8 @@ class ResultBase(MongoModel):
         description=(
             "Client (motore di misura) che ha prodotto il risultato. "
             "Riferimento diretto per la stessa ragione di targetId: consente di "
-            "confrontare o filtrare le misure per motore (curl vs Chrome) senza "
+            "confrontare o filtrare le misure per motore (curl, Chrome, Firefox) "
+            "senza "
             "doverlo dedurre risalendo al SessionItem."
         ),
     )
@@ -67,7 +68,7 @@ class ResultBase(MongoModel):
             "Ambiente su cui è stata eseguita la misura. Riferimento diretto "
             "come targetId/clientId: è la dimensione del confronto "
             "containerizzato vs virtualizzato, e averla qui evita di risalire "
-            "al SessionItem per ogni aggregazione (§5.8)."
+            "al SessionItem per ogni aggregazione (§5.9)."
         )
     )
     idx: int = Field(ge=0, description="Indice della ripetizione, a partire da 0")

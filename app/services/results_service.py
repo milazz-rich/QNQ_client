@@ -99,7 +99,7 @@ async def list_results(
             ``session_item_ids``, dato che uno stesso ``SessionItem`` può essere
             condiviso fra più sessioni.
         client_id: se valorizzato, restituisce solo i risultati prodotti da quel
-            motore di misura (confronto curl vs Chrome).
+            motore di misura (confronto fra curl, Chrome e Firefox).
         scenario_id: se valorizzato, filtra per scenario (riferimento diretto,
             preferibile a ``scenario_path`` che è uno snapshot testuale).
         target_id: se valorizzato, filtra per server sotto test.
