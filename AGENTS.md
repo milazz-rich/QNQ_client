@@ -1049,6 +1049,38 @@ catturata, vedi tabella sopra): produce un `Measurement` con
 crash, nessuna sessione bloccata, nessun dato silenziosamente perso o
 scambiato per una misura valida.
 
+#### Fallimento noto: `ERR_CONNECTION_CLOSED` su HTTP/2
+
+Osservato 3 volte nella campagna di misure reali del 2026-08-23/24 (§5.10,
+4320 misure totali): `net::ERR_CONNECTION_CLOSED` durante `page.goto()` su
+richieste **HTTP/2** (non HTTP/3 — non è quindi lo stesso fenomeno del
+paragrafo precedente, che riguarda solo `ERR_CERT_VERIFIER_CHANGED`, né la
+strumentazione lsquic descritta nel report della campagna, che riguarda solo
+richieste HTTP/3 su OpenLiteSpeed).
+
+| Target | Ambiente | Scenario |
+| ------ | -------- | -------- |
+| OpenLiteSpeed | docker | Microsoft |
+| OpenLiteSpeed | docker | Twitch |
+| Caddy | kvm | Wikipedia |
+
+Tasso: `3/720 = 0,42%` sulle misure Chrome HTTP/2 della campagna — campione
+troppo piccolo per un intervallo di confidenza utile, e distribuito su due
+target e due ambienti senza un pattern evidente (non è quindi imputabile in
+modo netto né a un target specifico né, diversamente da quanto ci si
+aspetterebbe per un problema di rete verso KVM, all'ambiente KVM: 2 delle 3
+occorrenze sono su Docker). Nessuna indagine multi-via è stata condotta —
+sarebbe prematura su un campione di 3 — questa voce documenta solo quanto
+osservato.
+
+**Causa non determinata.** Per forma è imparentato con `ERR_CERT_VERIFIER_CHANGED`
+(entrambi eccezioni del network stack Chromium catturate dallo stesso percorso
+di `page.goto()`, entrambi senza risposta HTTP quindi `responseCode=0`), ma è
+un codice d'errore diverso e non c'è evidenza sufficiente per assumere la
+stessa causa. Trattato con lo stesso principio: nessun fix applicativo
+necessario, il fallimento produce comunque un `Result` `status="failed"`
+tracciato correttamente.
+
 #### Dati estratti dal CDP
 
 Si filtrano gli eventi con `type == "Document"`: un browser carica anche le
@@ -1428,15 +1460,43 @@ in difficoltà — e mascherando, con un secondo tentativo silenzioso, un
 cambiamento reale della configurazione del server che è invece esattamente ciò
 che la misura deve segnalare.
 
-**Prima misura HTTP/3 dopo l'avvio.** Osservato una volta su una singola misura
-subito dopo l'avvio del server: `nextHopProtocol` è risultato `h2` invece di
-`h3`, con la ripetizione successiva e tutte le altre (9/9 su tre sessioni
-consecutive) tornate regolarmente a `h3`. È lo stesso genere di race che il
-priming DataStorage mitiga, non un fallimento sistematico, e la conseguenza è
-comunque un `Result` `failed` — mai una misura sbagliata registrata come valida,
-perché il controllo sul protocollo negoziato interviene prima. Non è stata
-aggiunta alcuna mitigazione: un retry nascosto violerebbe l'invariante di
-connessione a freddo.
+**Anomalia h2-invece-di-h3.** Una misura HTTP/3 ottiene occasionalmente
+`nextHopProtocol=h2` con status `200` invece di `h3`: protocollo negoziato
+diverso da quello richiesto, quindi `failed` per costruzione (§5.7 "Criterio
+di successo"), mai una misura sbagliata registrata come valida.
+
+Prima osservazione (sessione singola, fuori campagna): un'occorrenza isolata
+subito dopo l'avvio del server, con la ripetizione successiva e tutte le altre
+(9/9) tornate regolarmente a `h3` — da cui la caratterizzazione originaria
+come evento raro legato al cold-start del processo.
+
+Una campagna di misure reali del 2026-08-23/24 (9 sessioni, 3 target × 3
+client, 20 ripetizioni × 24 combinazioni scenario/ambiente/protocollo per
+sessione, 4320 misure totali) ha rivisto questa caratterizzazione: **14**
+occorrenze dello stesso segnale (stesso `nextHopProtocol=h2`, stesso status
+`200`), tutte su Firefox HTTP/3, così distribuite:
+
+| Target | Occorrenze | Tasso (su HTTP/3) | Docker | KVM |
+| ------ | ---------- | ------------------ | ------ | --- |
+| Caddy | 12 | 5,0% (12/240) | 7,5% (9/120) | 2,5% (3/120) |
+| OpenLiteSpeed | 1 | 0,4% (1/240) | 0,8% (1/120) | 0% |
+| nginx | 1 | 0,4% (1/240) | 0% | 0,8% (1/120) |
+
+L'indice di ripetizione (`idx`) delle 14 occorrenze è `1, 1, 1, 4, 4, 5, 5, 5,
+7, 13, 14, 15, 19, 19` — distribuito su tutto l'intervallo `0-19`, non
+concentrato nelle prime ripetizioni di ciascun item. La caratterizzazione
+"osservato solo al primo avvio" non regge più: il segnale ricorre per l'intera
+durata di una sessione, non solo subito dopo il lancio del processo, ed è
+sistematicamente più frequente su Caddy che sugli altri due target (l'unico
+elemento della prima osservazione confermato è che resta lo stesso genere di
+race sul profilo/DataStorage descritto sopra, non un fallimento imputabile al
+target). Resta comunque **non sistematico**: anche su Caddy Docker, dove il
+tasso è più alto, il 92,5% delle misure HTTP/3 negozia correttamente `h3`.
+
+Nessuna mitigazione aggiuntiva è stata introdotta, per lo stesso motivo di
+prima: un retry nascosto violerebbe l'invariante di connessione a freddo. Il
+dato aggiornato serve a chi pianifica una cattura Wireshark mirata (vedi il
+report della campagna) più che a giustificare un intervento sul codice.
 
 Le vecchie strade escluse restano escluse: il nome corretto della pref e
 `network.http.http3.enable` (non `enabled`), le mapping Alt-Svc forzate via pref
