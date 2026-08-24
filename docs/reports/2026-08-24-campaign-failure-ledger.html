@@ -1,0 +1,752 @@
+<title>Failure Ledger</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,500&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #FAF7F2;
+    --surface: #FFFFFF;
+    --surface-alt: #F1ECE3;
+    --text: #2A2622;
+    --text-muted: #6B6259;
+    --accent: #1F6F72;
+    --accent-soft: #DCEEEE;
+    --border: #E4DDD0;
+    --ok: #3E7A4E;
+    --ok-soft: #E1EEE3;
+    --cat-a: #B8863C; /* rate limiter */
+    --cat-a-soft: #F5EBD8;
+    --cat-b: #B54834; /* lsquic */
+    --cat-b-soft: #F5E1DC;
+    --cat-c: #6B5B95; /* cert verifier */
+    --cat-c-soft: #E9E4F2;
+    --cat-d: #2F6FA8; /* firefox anomaly */
+    --cat-d-soft: #DFE9F2;
+    --cat-e: #6B6259; /* unclassified */
+    --cat-e-soft: #E9E4DA;
+    --shadow: 0 1px 2px rgba(42,38,34,0.06), 0 8px 24px -12px rgba(42,38,34,0.18);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1C1A17;
+      --surface: #24211D;
+      --surface-alt: #2C2822;
+      --text: #EDE8DF;
+      --text-muted: #A79E90;
+      --accent: #4FBFC0;
+      --accent-soft: #1F3A3A;
+      --border: #3A342C;
+      --ok: #7FBF8F;
+      --ok-soft: #24332A;
+      --cat-a: #D9A65C;
+      --cat-a-soft: #382E1E;
+      --cat-b: #E17A5F;
+      --cat-b-soft: #3A2620;
+      --cat-c: #9B87C4;
+      --cat-c-soft: #2C2738;
+      --cat-d: #6FA8D8;
+      --cat-d-soft: #212B36;
+      --cat-e: #A79E90;
+      --cat-e-soft: #2C2822;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #1C1A17;
+    --surface: #24211D;
+    --surface-alt: #2C2822;
+    --text: #EDE8DF;
+    --text-muted: #A79E90;
+    --accent: #4FBFC0;
+    --accent-soft: #1F3A3A;
+    --border: #3A342C;
+    --ok: #7FBF8F;
+    --ok-soft: #24332A;
+    --cat-a: #D9A65C;
+    --cat-a-soft: #382E1E;
+    --cat-b: #E17A5F;
+    --cat-b-soft: #3A2620;
+    --cat-c: #9B87C4;
+    --cat-c-soft: #2C2738;
+    --cat-d: #6FA8D8;
+    --cat-d-soft: #212B36;
+    --cat-e: #A79E90;
+    --cat-e-soft: #2C2822;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Public Sans', -apple-system, 'Segoe UI', sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection { background: var(--accent-soft); }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 4rem 1.75rem 6rem;
+  }
+
+  header.masthead {
+    margin-bottom: 3rem;
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 0 0 0.9rem;
+  }
+
+  h1 {
+    font-family: 'Newsreader', Georgia, serif;
+    font-weight: 500;
+    font-size: clamp(2.4rem, 5vw, 3.4rem);
+    line-height: 1.05;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.9rem;
+    text-wrap: balance;
+    color: var(--text);
+  }
+
+  .lede {
+    font-size: 1.1rem;
+    color: var(--text-muted);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .lede strong { color: var(--text); font-weight: 600; }
+
+  /* stat strip */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 2.75rem 0 3.5rem;
+    box-shadow: var(--shadow);
+  }
+
+  .stat {
+    background: var(--surface);
+    padding: 1.15rem 1.1rem;
+  }
+
+  .stat .n {
+    font-family: 'IBM Plex Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 1.55rem;
+    font-weight: 600;
+    color: var(--text);
+    display: block;
+  }
+
+  .stat .n.accent { color: var(--accent); }
+
+  .stat .l {
+    font-size: 0.74rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-top: 0.3rem;
+  }
+
+  section { margin: 3.6rem 0; }
+
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.85rem;
+    margin-bottom: 1.1rem;
+  }
+
+  .step-num {
+    font-family: 'Newsreader', serif;
+    font-style: italic;
+    font-size: 1.5rem;
+    color: var(--accent);
+    flex-shrink: 0;
+    min-width: 1.6rem;
+  }
+
+  h2 {
+    font-family: 'Newsreader', Georgia, serif;
+    font-weight: 500;
+    font-size: 1.65rem;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+
+  h3 {
+    font-family: 'Public Sans', sans-serif;
+    font-weight: 700;
+    font-size: 1.02rem;
+    margin: 0 0 0.5rem;
+    color: var(--text);
+  }
+
+  p { margin: 0 0 1rem; color: var(--text); }
+  p.muted { color: var(--text-muted); font-size: 0.95rem; }
+  section > p:first-of-type { margin-top: 0; }
+
+  code, .mono {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.88em;
+  }
+
+  code {
+    background: var(--surface-alt);
+    padding: 0.12em 0.4em;
+    border-radius: 4px;
+    color: var(--text);
+  }
+
+  a { color: var(--accent); }
+
+  .table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 520px;
+    font-size: 0.92rem;
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.62rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  th {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    font-weight: 600;
+    background: var(--surface-alt);
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  td.num, th.num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  td.wrap, th.wrap { white-space: normal; }
+
+  tr.total td {
+    font-weight: 700;
+    background: var(--surface-alt);
+  }
+
+  /* category cards */
+  .cat {
+    border: 1px solid var(--border);
+    border-left: 5px solid var(--cat-color, var(--accent));
+    border-radius: 10px;
+    background: var(--surface);
+    padding: 1.4rem 1.5rem 1.5rem;
+    margin: 1.4rem 0;
+    box-shadow: var(--shadow);
+  }
+
+  .cat-a { --cat-color: var(--cat-a); }
+  .cat-b { --cat-color: var(--cat-b); }
+  .cat-c { --cat-color: var(--cat-c); }
+  .cat-d { --cat-color: var(--cat-d); }
+  .cat-e { --cat-color: var(--cat-e); }
+
+  .cat-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.7rem;
+  }
+
+  .cat-title { display: flex; align-items: center; gap: 0.6rem; }
+
+  .cat-title h3 { margin: 0; font-size: 1.08rem; }
+
+  .chip {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 0.22rem 0.55rem;
+    border-radius: 5px;
+    background: var(--cat-soft, var(--accent-soft));
+    color: var(--cat-color, var(--accent));
+    white-space: nowrap;
+  }
+
+  .cat-a .chip { --cat-soft: var(--cat-a-soft); }
+  .cat-b .chip { --cat-soft: var(--cat-b-soft); }
+  .cat-c .chip { --cat-soft: var(--cat-c-soft); }
+  .cat-d .chip { --cat-soft: var(--cat-d-soft); }
+  .cat-e .chip { --cat-soft: var(--cat-e-soft); }
+
+  .verdict {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.22rem 0.6rem;
+    border-radius: 999px;
+  }
+  .verdict.consistent { background: var(--ok-soft); color: var(--ok); }
+  .verdict.diverges { background: var(--cat-b-soft); color: var(--cat-b); }
+  .verdict.no-baseline { background: var(--surface-alt); color: var(--text-muted); }
+
+  .cat-figures {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 1rem;
+    margin: 0.9rem 0 1.1rem;
+    padding: 0.9rem 1rem;
+    background: var(--surface-alt);
+    border-radius: 8px;
+  }
+
+  .cat-figures .f .n {
+    font-family: 'IBM Plex Mono', monospace;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: 1.15rem;
+    color: var(--cat-color, var(--text));
+    display: block;
+  }
+  .cat-figures .f .l {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
+  }
+
+  .logline {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8rem;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0.7rem 0.9rem;
+    overflow-x: auto;
+    white-space: pre;
+    color: var(--text);
+    margin: 0.7rem 0;
+  }
+
+  .logline .lvl { color: var(--cat-b); }
+  .logline .mod { color: var(--text-muted); }
+
+  .callout {
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 1.1rem 1.3rem;
+    background: var(--surface-alt);
+    font-size: 0.93rem;
+    color: var(--text-muted);
+  }
+
+  .callout strong { color: var(--text); }
+
+  .not-observed {
+    border-left-color: var(--border);
+  }
+
+  .repro-table td.combo { font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; }
+
+  footer {
+    margin-top: 4.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  @media (max-width: 640px) {
+    .page { padding: 2.5rem 1.1rem 4rem; }
+    th, td { padding: 0.5rem 0.6rem; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Analisi post-campagna &middot; QNQ_client</p>
+    <h1>Failure Ledger</h1>
+    <p class="lede">
+      124 misure fallite su 4.320 tentativi, in <strong>9 sessioni</strong> reali
+      (3 target &times; 3 motori di misura) eseguite fra le <strong>23:48 e le 02:21 UTC</strong>
+      del 23&ndash;24 agosto 2026. Ogni fallimento è ricondotto a una riga di log,
+      classificato per firma e, dove i dati bastano, associato alla sessione
+      Wireshark che lo riproduce con la massima probabilità.
+    </p>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><span class="n">4.320</span><span class="l">Tentativi totali</span></div>
+    <div class="stat"><span class="n">4.196</span><span class="l">Completati</span></div>
+    <div class="stat"><span class="n accent">124</span><span class="l">Falliti</span></div>
+    <div class="stat"><span class="n">2,87%</span><span class="l">Tasso di fallimento</span></div>
+    <div class="stat"><span class="n">9</span><span class="l">Sessioni</span></div>
+    <div class="stat"><span class="n">2h 32m</span><span class="l">Durata campagna</span></div>
+  </div>
+
+  <section id="raccolta">
+    <div class="section-head">
+      <span class="step-num">1</span>
+      <h2>Raccolta dati</h2>
+    </div>
+    <p>
+      Le 9 sessioni nel database (<code>curl</code>, <code>Chrome</code>, <code>Firefox</code>
+      &times; Caddy, OpenLiteSpeed, nginx) coprono per intero questa campagna: nessun'altra
+      sessione precede o segue nella finestra osservata, quindi l'insieme non è ambiguo.
+      Ogni sessione esegue 6 scenari &times; 2 ambienti &times; 2 protocolli &times; 20
+      ripetizioni = 480 misure, per un totale di 4.320.
+    </p>
+    <p>
+      Ogni <code>Result</code> con <code>status="failed"</code> è stato incrociato con il file
+      <code>logs/sessions/{sessionId}.log</code> corrispondente (§5.10): il timestamp del
+      <code>Result</code> e l'URL host:porta dell'endpoint identificano senza ambiguità la riga
+      <code>WARNING</code> del client che l'ha prodotto. La correlazione ha chiuso il 100% dei
+      casi &mdash; ogni sessione mostra esattamente il doppio di righe <code>WARNING</code>
+      rispetto ai suoi fallimenti (una dal modulo del client, una da
+      <code>measurement.runner</code>), coerente con quanto verificato nella scorsa
+      indagine sul logging. <code>Result</code> non ha un campo <code>error</code> (§3.3): il
+      log di sessione resta l'unica fonte del motivo del fallimento.
+    </p>
+  </section>
+
+  <section id="classificazione">
+    <div class="section-head">
+      <span class="step-num">2</span>
+      <h2>Pattern noti, per firma</h2>
+    </div>
+    <p>
+      Quattro dei cinque pattern indicati come noti compaiono davvero nei dati di questa
+      campagna, ciascuno riconosciuto dal testo esatto della riga di log &mdash; non dal
+      solo tasso complessivo. Le percentuali sono calcolate sul totale dei tentativi della
+      combinazione specifica, non sul totale dei fallimenti.
+    </p>
+
+    <div class="cat cat-a">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Rate limiter OpenLiteSpeed</h3><span class="chip">HTTP 403</span></div>
+        <span class="verdict no-baseline">nessun tasso storico in AGENTS.md</span>
+      </div>
+      <div class="cat-figures">
+        <div class="f"><span class="n">47</span><span class="l">occorrenze</span></div>
+        <div class="f"><span class="n">37,9%</span><span class="l">dei 124 fallimenti</span></div>
+        <div class="f"><span class="n">solo curl</span><span class="l">Chrome/Firefox: 0</span></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Protocollo</th><th>Ambiente</th><th class="num">Fallimenti</th><th class="num">Tasso</th></tr></thead>
+          <tbody>
+            <tr><td>HTTP/2</td><td>KVM</td><td class="num">18 / 120</td><td class="num">15,0%</td></tr>
+            <tr><td>HTTP/3</td><td>KVM</td><td class="num">14 / 120</td><td class="num">11,7%</td></tr>
+            <tr><td>HTTP/2</td><td>Docker</td><td class="num">12 / 120</td><td class="num">10,0%</td></tr>
+            <tr><td>HTTP/3</td><td>Docker</td><td class="num">3 / 120</td><td class="num">2,5%</td></tr>
+            <tr class="total"><td colspan="2">KVM combinato vs Docker combinato</td><td class="num">32/240 vs 15/240</td><td class="num">13,3% vs 6,2%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">
+        Firma: <code>responseCode=403</code>, protocollo negoziato sempre corretto
+        (§5.3). Coerente in <strong>direzione</strong> con "più frequente su KVM"
+        (~2,1&times;), ma AGENTS.md non fissa un tasso di riferimento (il "~35% residuo"
+        citato come possibile aspettativa non compare nel documento): il 9,8% osservato
+        su tutte le misure curl/OpenLiteSpeed di questa campagna è il primo dato
+        quantificato disponibile, non una conferma o smentita di un numero pregresso.
+        Nessuna occorrenza su Chrome o Firefox &mdash; il rate limiter colpisce solo le
+        connessioni ravvicinate di curl, unico motore senza pausa fra l'avvio del
+        processo e la richiesta.
+      </p>
+    </div>
+
+    <div class="cat cat-b">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Instabilità QUIC (lsquic) &middot; OpenLiteSpeed HTTP/3</h3><span class="chip">ERR_QUIC_PROTOCOL_ERROR</span></div>
+        <span class="verdict consistent">coerente con ~25% atteso</span>
+      </div>
+      <div class="cat-figures">
+        <div class="f"><span class="n">59</span><span class="l">occorrenze</span></div>
+        <div class="f"><span class="n">47,6%</span><span class="l">dei 124 fallimenti</span></div>
+        <div class="f"><span class="n">24,6%</span><span class="l">su 240 tentativi</span></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Ambiente</th><th class="num">Fallimenti</th><th class="num">Tasso</th></tr></thead>
+          <tbody>
+            <tr><td>KVM</td><td class="num">31 / 120</td><td class="num">25,8%</td></tr>
+            <tr><td>Docker</td><td class="num">28 / 120</td><td class="num">23,3%</td></tr>
+            <tr class="total"><td>Combinato</td><td class="num">59 / 240</td><td class="num">24,6%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="logline"><span class="mod">app.services.measurement.chrome_client</span>: Misura scartata, navigazione Chrome fallita: <strong>net::ERR_QUIC_PROTOCOL_ERROR</strong> at https://milaz.it:8443/content/microsoft/</div>
+      <p class="muted">
+        58 delle 59 occorrenze sono <code>ERR_QUIC_PROTOCOL_ERROR</code> letterale; la
+        59&ordf; è una variante di superficie dello stesso guasto &mdash; Chrome mostra
+        la propria pagina d'errore interna (<code>chrome-error://chromewebdata/</code>),
+        intercettata dal validatore di catena di navigazione (§5.6) invece che
+        dall'eccezione diretta &mdash; ma stesso target, stesso protocollo, stessa
+        sessione: non un fallimento a parte. <strong>Solo Chrome</strong>: curl sullo
+        stesso target/protocollo (17 fallimenti HTTP/3 su OpenLiteSpeed) è invece
+        sempre <code>403</code> da rate limiter, mai un errore QUIC &mdash; la firma
+        "Chrome e curl" attesa per questo pattern non regge in questa campagna, è
+        <strong>Chrome soltanto</strong>. Il 24,6% osservato è coerente con il ~25%
+        di riferimento.
+      </p>
+    </div>
+
+    <div class="cat cat-c">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Instabilità del verificatore certificati</h3><span class="chip">ERR_CERT_VERIFIER_CHANGED</span></div>
+        <span class="verdict consistent">coerente (IC95% 0,06&ndash;1,86%)</span>
+      </div>
+      <div class="cat-figures">
+        <div class="f"><span class="n">1</span><span class="l">occorrenza</span></div>
+        <div class="f"><span class="n">0,14%</span><span class="l">su 720 tentativi Chrome/HTTP2</span></div>
+        <div class="f"><span class="n">nginx&thinsp;/&thinsp;KVM</span><span class="l">target di questa occorrenza</span></div>
+      </div>
+      <p class="muted">
+        AGENTS.md §5.6 documenta un tasso storico di <code>1/300 = 0,33%</code>
+        (IC95% 0,06&ndash;1,86%), osservato su Caddy/Docker. Questa campagna ne
+        aggiunge una seconda occorrenza indipendente, stavolta su nginx/KVM: 1/720 =
+        0,14%, dentro l'intervallo di confidenza storico. Coerente con la causa già
+        indagata (race interna al network stack Chromium sull'inizializzazione del
+        verificatore certificati su un profilo nuovo, §5.6) &mdash; non legata a un
+        target o ambiente specifico, come conferma il fatto che sia comparsa su una
+        combinazione diversa dalla prima osservazione.
+      </p>
+    </div>
+
+    <div class="cat cat-d">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Anomalia Firefox h2 invece di h3</h3><span class="chip">nextHopProtocol=h2</span></div>
+        <span class="verdict diverges">stesso segnale, tasso e tempistica diversi dal documentato</span>
+      </div>
+      <div class="cat-figures">
+        <div class="f"><span class="n">14</span><span class="l">occorrenze</span></div>
+        <div class="f"><span class="n">11,3%</span><span class="l">dei 124 fallimenti</span></div>
+        <div class="f"><span class="n">5,0%</span><span class="l">su Caddy/HTTP3</span></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Target</th><th class="num">Fallimenti</th><th class="num">Docker</th><th class="num">KVM</th></tr></thead>
+          <tbody>
+            <tr><td>Caddy</td><td class="num">12 / 240</td><td class="num">7,5%</td><td class="num">2,5%</td></tr>
+            <tr><td>OpenLiteSpeed</td><td class="num">1 / 240</td><td class="num">0,8%</td><td class="num">0%</td></tr>
+            <tr><td>nginx</td><td class="num">1 / 240</td><td class="num">0%</td><td class="num">0,8%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">
+        AGENTS.md §5.7 descriveva questo segnale come "osservato una volta, subito dopo
+        l'avvio del server, non riproducibile". Stessa firma esatta qui (<code>h2</code>
+        al posto di <code>h3</code>, status <code>200</code>), ma il tasso reale è
+        tutt'altro che raro su Caddy (7,5% su Docker) e gli indici di ripetizione delle
+        14 occorrenze &mdash; <code>1, 1, 1, 4, 4, 5, 5, 5, 7, 13, 14, 15, 19, 19</code>
+        &mdash; sono distribuiti su tutta la sessione, non concentrati all'avvio.
+        AGENTS.md §5.7 è stato aggiornato con questi numeri (stesso pattern, non uno
+        nuovo: nessuna nuova indagine aperta).
+      </p>
+    </div>
+  </section>
+
+  <section id="nuovi">
+    <div class="section-head">
+      <span class="step-num">3</span>
+      <h2>Fuori dai pattern noti</h2>
+    </div>
+    <p>
+      Le quattro categorie sopra sommano <strong>121</strong> dei 124 fallimenti. I
+      restanti 3 condividono una firma diversa da tutte le precedenti; la quinta
+      categoria indicata come possibile (fallimento di rete puro verso KVM) non compare
+      affatto in questa campagna.
+    </p>
+
+    <div class="cat cat-e">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Chiusura di connessione anomala</h3><span class="chip">ERR_CONNECTION_CLOSED</span></div>
+        <span class="verdict no-baseline">genuinamente nuovo (n troppo piccolo per conclusioni)</span>
+      </div>
+      <div class="cat-figures">
+        <div class="f"><span class="n">3</span><span class="l">occorrenze</span></div>
+        <div class="f"><span class="n">0,42%</span><span class="l">su 720 tentativi Chrome/HTTP2</span></div>
+        <div class="f"><span class="n">2 target</span><span class="l">2 ambienti</span></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Target</th><th>Ambiente</th><th>Scenario</th></tr></thead>
+          <tbody>
+            <tr><td>OpenLiteSpeed</td><td>Docker</td><td>Microsoft</td></tr>
+            <tr><td>OpenLiteSpeed</td><td>Docker</td><td>Twitch</td></tr>
+            <tr><td>Caddy</td><td>KVM</td><td>Wikipedia</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="logline"><span class="mod">app.services.measurement.chrome_client</span>: Misura scartata, navigazione Chrome fallita: <strong>net::ERR_CONNECTION_CLOSED</strong> at https://milaz.it:8443/content/microsoft/</div>
+      <p class="muted">
+        Verificato che non sia una variante di superficie dei pattern sopra: è
+        <strong>HTTP/2</strong> (non HTTP/3, quindi non lsquic/QUIC) su
+        <strong>connessione TCP</strong>, un codice d'errore Chromium distinto da
+        <code>ERR_CERT_VERIFIER_CHANGED</code>, senza risposta HTTP
+        (<code>responseCode=0</code>, quindi non il rate limiter di curl, che risponde
+        sempre con <code>403</code>). 2 delle 3 occorrenze sono su <strong>Docker</strong>,
+        non KVM &mdash; non si presta a essere spiegato dalla nota instabilità
+        dell'infrastruttura KVM. Documentato in AGENTS.md §5.6, come voce indipendente
+        accanto a <code>ERR_CERT_VERIFIER_CHANGED</code>: nessuna causa assunta, nessuna
+        indagine aperta su un campione di 3.
+      </p>
+    </div>
+
+    <div class="cat not-observed">
+      <div class="cat-head">
+        <div class="cat-title"><h3>Fallimento di rete puro verso KVM</h3><span class="chip">timeout / connection refused</span></div>
+        <span class="verdict no-baseline">0 occorrenze in questa campagna</span>
+      </div>
+      <p class="muted">
+        Categoria attesa ma <strong>assente</strong> dai dati: nessuna delle 124 righe
+        di fallimento mostra un timeout di connessione o un rifiuto puro (il tipo
+        verificato in precedenza con <code>ERR_CONNECTION_REFUSED</code> e
+        <code>Timeout Nms exceeded</code> su una porta chiusa reale). Ogni fallimento
+        curl di questa campagna è <code>403</code> applicativo, non un errore di rete;
+        Firefox non mostra mai <code>responseCode=0</code>. L'unico segnale
+        "di rete a basso livello" osservato è <code>ERR_CONNECTION_CLOSED</code> sopra,
+        che però non è esclusivo di KVM (2/3 su Docker) e passa comunque attraverso
+        un'eccezione applicativa di Chrome, non un fallimento grezzo di connessione
+        curl/Firefox. L'infrastruttura KVM, in questa finestra di 2h32m, non ha
+        prodotto l'instabilità di rete pura che questa categoria anticipava.
+      </p>
+    </div>
+  </section>
+
+  <section id="wireshark">
+    <div class="section-head">
+      <span class="step-num">4</span>
+      <h2>Sessioni mirate per Wireshark</h2>
+    </div>
+    <p>
+      Ripetizioni calcolate perché la probabilità di <strong>zero</strong> occorrenze in
+      una sessione breve sia trascurabile (&le;1%), usando il tasso più alto
+      osservato in questa campagna per ciascun pattern, non un valore storico.
+    </p>
+    <div class="table-wrap">
+      <table class="repro-table">
+        <thead>
+          <tr><th>Pattern</th><th>Combinazione</th><th class="num">Tasso oss.</th><th class="num">Ripetizioni</th><th class="wrap">Nota</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Rate limiter</td>
+            <td class="combo">curl &middot; OpenLiteSpeed &middot; HTTP/2 &middot; KVM</td>
+            <td class="num">15,0%</td>
+            <td class="num">30&ndash;40</td>
+            <td class="wrap">P(0 occorrenze) &lt; 1% da 29 rep; 40 lascia margine.</td>
+          </tr>
+          <tr>
+            <td>lsquic / QUIC</td>
+            <td class="combo">Chrome &middot; OpenLiteSpeed &middot; HTTP/3 &middot; KVM</td>
+            <td class="num">25,8%</td>
+            <td class="num">17&ndash;25</td>
+            <td class="wrap">P(0 occorrenze) &lt; 1% da 17 rep; 25 per margine 99,9%.</td>
+          </tr>
+          <tr>
+            <td>Anomalia Firefox</td>
+            <td class="combo">Firefox &middot; Caddy &middot; HTTP/3 &middot; Docker</td>
+            <td class="num">7,5%</td>
+            <td class="num">60&ndash;90</td>
+            <td class="wrap">P(0 occorrenze) &lt; 1% da 60 rep; sessione più lunga delle altre due.</td>
+          </tr>
+          <tr>
+            <td>Cert. verifier</td>
+            <td class="combo">Chrome &middot; qualunque target &middot; HTTP/2</td>
+            <td class="num">0,14%</td>
+            <td class="num">non pratico</td>
+            <td class="wrap">Servirebbero ~1.400&ndash;3.300 rep per il 99%: cattura opportunistica durante altre sessioni HTTP/2, non una sessione dedicata.</td>
+          </tr>
+          <tr>
+            <td>Connessione chiusa</td>
+            <td class="combo">Chrome &middot; OpenLiteSpeed &middot; HTTP/2 &middot; Docker</td>
+            <td class="num">1,7%*</td>
+            <td class="num">non pratico</td>
+            <td class="wrap">*Stima su n=3, bassa confidenza. ~270 rep per il 99%: piggyback sulla sessione lsquic (stesso target), non dedicata.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="riepilogo">
+    <div class="section-head">
+      <span class="step-num">5</span>
+      <h2>Riepilogo campagna</h2>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Motore</th><th>Ambiente</th><th class="num">Riuscite</th><th class="num">Fallite</th><th class="num">Totale</th><th class="num">Tasso</th></tr></thead>
+        <tbody>
+          <tr><td>curl</td><td>Docker</td><td class="num">705</td><td class="num">15</td><td class="num">720</td><td class="num">2,08%</td></tr>
+          <tr><td>curl</td><td>KVM</td><td class="num">688</td><td class="num">32</td><td class="num">720</td><td class="num">4,44%</td></tr>
+          <tr><td>Chrome</td><td>Docker</td><td class="num">690</td><td class="num">30</td><td class="num">720</td><td class="num">4,17%</td></tr>
+          <tr><td>Chrome</td><td>KVM</td><td class="num">687</td><td class="num">33</td><td class="num">720</td><td class="num">4,58%</td></tr>
+          <tr><td>Firefox</td><td>Docker</td><td class="num">710</td><td class="num">10</td><td class="num">720</td><td class="num">1,39%</td></tr>
+          <tr><td>Firefox</td><td>KVM</td><td class="num">716</td><td class="num">4</td><td class="num">720</td><td class="num">0,56%</td></tr>
+          <tr class="total"><td colspan="2">Totale campagna</td><td class="num">4.196</td><td class="num">124</td><td class="num">4.320</td><td class="num">2,87%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin-top:2.2rem;">Sessioni Wireshark consigliate</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Combinazione</th><th class="num">Ripetizioni</th><th>Priorità</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td class="combo">Chrome &middot; OpenLiteSpeed &middot; HTTP/3 &middot; KVM</td><td class="num">25</td><td>Alta &mdash; 47,6% dei fallimenti totali</td></tr>
+          <tr><td>2</td><td class="combo">curl &middot; OpenLiteSpeed &middot; HTTP/2 &middot; KVM</td><td class="num">40</td><td>Alta &mdash; 37,9% dei fallimenti totali</td></tr>
+          <tr><td>3</td><td class="combo">Firefox &middot; Caddy &middot; HTTP/3 &middot; Docker</td><td class="num">75</td><td>Media &mdash; correzione di una caratterizzazione documentata</td></tr>
+          <tr><td>4</td><td class="combo">Chrome &middot; qualunque target &middot; HTTP/2 (opportunistica)</td><td class="num">&mdash;</td><td>Bassa &mdash; cattura passiva durante 1&ndash;3, non dedicata</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <span>Campagna 2026-08-23 23:48 &ndash; 2026-08-24 02:21 UTC &middot; 9 sessioni &middot; 4.320 misure</span>
+    <span>Fonte: <code>results</code> + <code>logs/sessions/*.log</code></span>
+  </footer>
+
+</div>
