@@ -15,6 +15,8 @@ HTTP/2 o HTTP/3 — ed è esattamente il confronto che l'applicazione esiste per
 fare.
 """
 
+from datetime import datetime
+
 from pydantic import Field
 
 from app.models.common import Environment, MongoDocument, MongoId, MongoModel, Protocol
@@ -47,6 +49,28 @@ class SessionItemUpdate(MongoModel):
 
 class SessionItem(SessionItemBase, MongoDocument):
     """Rappresentazione completa di un SessionItem restituita dall'API."""
+
+
+class OrphanedSessionItem(SessionItem):
+    """Un ``SessionItem`` non referenziato da nessuna ``Session`` esistente.
+
+    Estende ``SessionItem`` con ``createdAt``, che non è un campo persistito:
+    nessuna entità di questo progetto ha un campo "data di creazione" salvato
+    esplicitamente. Deriva invece dall'``ObjectId`` stesso — i primi 4 byte
+    codificano un timestamp Unix (``ObjectId.generation_time``) — quindi non
+    richiede né una migrazione né una scrittura in più a ogni creazione: è
+    sempre disponibile e sempre accurato, per qualunque ``SessionItem`` sia
+    mai stato creato, compresi quelli esistenti prima di questo endpoint.
+    """
+
+    created_at: datetime = Field(
+        alias="createdAt",
+        description=(
+            "Istante di creazione, ricavato dall'ObjectId (nessun campo "
+            "persistito): utile per decidere se un item orfano sia un residuo "
+            "recente di una sessione appena eliminata o uno dimenticato da tempo"
+        ),
+    )
 
 
 class SessionItemBatchCreate(MongoModel):
@@ -82,4 +106,13 @@ class SessionItemBatchResult(MongoModel):
             "Identificativi creati, in ordine deterministico: scenario esterno, "
             "poi protocollo, poi ambiente"
         )
+    )
+
+
+class OrphanedSessionItemsDeleteResult(MongoModel):
+    """Esito di ``DELETE /api/session-items/orphaned``."""
+
+    count: int = Field(ge=0, description="Numero di SessionItem orfani cancellati")
+    ids: list[MongoId] = Field(
+        description="Identificativi effettivamente cancellati"
     )

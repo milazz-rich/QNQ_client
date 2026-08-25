@@ -3,16 +3,25 @@
 Il router non tocca MongoDB: valida l'input, delega a ``session_items_service``
 e lascia che le eccezioni applicative vengano tradotte dagli handler centralizzati.
 
-L'endpoint ``POST /session-items/batch`` è dichiarato *prima* di
-``POST /session-items/{session_item_id}`` nel file, ma la sua rotta è statica
-(``/batch``) e quella parametrica (``/{session_item_id}``) è su ``GET``, quindi
-non c'è ambiguità di instradamento fra le due.
+**Ordine delle rotte.** ``GET``/``DELETE /session-items/orphaned`` sono
+dichiarate *prima* di ``GET``/``DELETE /session-items/{session_item_id}``:
+entrambe le coppie condividono verbo e livello di path, e FastAPI risolve
+nell'ordine di dichiarazione. Invertendole, ``orphaned`` verrebbe interpretato
+come un ``session_item_id`` e produrrebbe un ``422`` (non rispetta il pattern a
+24 caratteri esadecimali) invece di raggiungere l'endpoint di manutenzione —
+stesso principio già applicato a ``/results/aggregate`` (§5.9).
+
+``POST /session-items/batch`` non ha invece bisogno di quell'accortezza: la sua
+rotta è statica e quella parametrica omonima è su ``GET``, quindi non c'è
+ambiguità di instradamento fra le due.
 """
 
 from fastapi import APIRouter, Path, status
 
 from app.models.common import ErrorResponse
 from app.models.session_item import (
+    OrphanedSessionItem,
+    OrphanedSessionItemsDeleteResult,
     SessionItem,
     SessionItemBatchCreate,
     SessionItemBatchResult,
@@ -47,6 +56,69 @@ async def list_session_items() -> list[SessionItem]:
         Delega a ``session_items_service.list_session_items``.
     """
     return await session_items_service.list_session_items()
+
+
+@router.get(
+    "/orphaned",
+    response_model=list[OrphanedSessionItem],
+    summary="Elenca i session item non referenziati da nessuna sessione",
+)
+async def list_orphaned_session_items() -> list[OrphanedSessionItem]:
+    """Restituisce i session item orfani, candidati alla pulizia.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        ``200`` con la lista dei ``SessionItem`` il cui ``id`` non compare
+        nell'array ``items`` di nessuna ``Session`` esistente — ciascuno con
+        ``scenarioId``, ``protocol``, ``environment`` e ``createdAt``,
+        sufficienti per decidere se conservarlo o cancellarlo senza doverlo
+        aprire singolarmente.
+
+    Fa:
+        Delega a ``session_items_service.list_orphaned_session_items``. È di
+        sola lettura: non cancella nulla, a differenza di
+        ``DELETE /session-items/orphaned`` sotto. Uno stesso item può ricomparire
+        qui anche dopo essere stato "salvato" da un rilancio (§3.3): l'elenco
+        riflette sempre lo stato attuale del database, mai una decisione
+        precedente.
+    """
+    return await session_items_service.list_orphaned_session_items()
+
+
+@router.delete(
+    "/orphaned",
+    response_model=OrphanedSessionItemsDeleteResult,
+    summary="Cancella tutti i session item non referenziati da nessuna sessione",
+)
+async def delete_orphaned_session_items() -> OrphanedSessionItemsDeleteResult:
+    """Cancella tutti i session item correntemente orfani.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        ``200`` con il conteggio e gli ``id`` effettivamente cancellati.
+        ``200`` e non ``204`` perché, a differenza di
+        ``DELETE /session-items/{id}``, il corpo della risposta è
+        l'informazione principale: senza, il chiamante non saprebbe cosa è
+        stato rimosso senza un'altra chiamata a ``GET /orphaned`` prima.
+
+    Fa:
+        Delega a ``session_items_service.delete_orphaned_session_items``, che
+        **ricalcola** l'insieme degli orfani al momento della chiamata — non
+        riusa un elenco ottenuto da una precedente ``GET``, che nel frattempo
+        potrebbe essere diventato stale (un rilancio può aver riassegnato uno
+        di quegli item, §3.3). Il vincolo di integrità referenziale di
+        ``DELETE /session-items/{id}`` resta comunque attivo per ciascun item:
+        questo endpoint lo riusa internamente invece di duplicarlo, quindi un
+        item riassegnato nella finestra fra il calcolo e la cancellazione
+        viene saltato, non cancellato a forza. Restituisce sempre ``200``,
+        anche con lista vuota: nessun orfano da cancellare non è un errore.
+    """
+    ids = await session_items_service.delete_orphaned_session_items()
+    return OrphanedSessionItemsDeleteResult(count=len(ids), ids=ids)
 
 
 @router.get(

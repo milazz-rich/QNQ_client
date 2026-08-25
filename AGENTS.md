@@ -123,7 +123,8 @@ routers/  →  services/  →  db/
 
 Implementato: config, connessione Mongo, CORS, error handling, `/api/health`,
 CRUD completo per `targets`, `scenarios`, `clients`, `session_items` (con
-`POST /session-items/batch`), `sessions` (con `POST /sessions/{id}/start`),
+`POST /session-items/batch` e la manutenzione degli orfani, §5.5),
+`sessions` (con `POST /sessions/{id}/start`),
 lettura filtrata e paginata di `results` (§5.8) con endpoint di aggregazione
 (§5.9), il session runner in background con log su file per sessione
 (`GET /sessions/{id}/log`, §5.10) e **tre motori di misura**: `curl`
@@ -265,6 +266,12 @@ eliminabile solo se non appartiene a nessuna sessione esistente — il che rende
 strutturalmente impossibile il caso di un `Result` segnaposto che debba
 recuperare `targetId`/`scenarioId`/`environment` da un `SessionItem` già
 cancellato (§5.4).
+
+**SessionItem orfani.** La cancellazione di una `Session` non cancella a
+cascata i suoi `SessionItem` (§5.5): uno che resta senza più nessuna sessione
+a referenziarlo non sparisce, resta disponibile per un rilancio futuro. La
+pulizia è un'azione esplicita separata — `GET`/`DELETE /api/session-items/orphaned`
+— non automatica (§5.5).
 
 #### Session — collezione `sessions`
 
@@ -1045,6 +1052,63 @@ cancellazione (già avvenuta): viene loggato e basta.
 > per non cancellare i risultati di altre sessioni al rilancio.
 
 Sul versante lettura vedi §5.8.
+
+#### Manutenzione: SessionItem orfani
+
+Deliberatamente **assente** dalla cascata sopra: cancellare una `Session` non
+cancella i suoi `SessionItem`, nemmeno quelli che restano senza nessun'altra
+sessione a referenziarli. È voluto, non una svista — un `SessionItem`
+"diventato orfano" in quel momento è candidato a un rilancio o a una
+riproposizione futura (§3.3): lo stesso *(scenario, protocollo, ambiente)*
+potrebbe tornare utile in una sessione successiva, e cancellarlo a forza nella
+cascata costringerebbe a ricrearlo identico ogni volta.
+
+Il compromesso è un endpoint di manutenzione **esplicito**, mai automatico:
+
+```
+GET    /api/session-items/orphaned    → elenca gli orfani attuali
+DELETE /api/session-items/orphaned    → cancella gli orfani attuali
+```
+
+Un `SessionItem` è orfano se il suo `id` non compare nell'array `items` di
+**nessuna** `Session` esistente — sia perché tutte le sessioni che lo
+referenziavano sono state cancellate, sia perché non è mai stato assegnato a
+nessuna sessione fin dalla creazione: per questa definizione i due casi sono
+indistinguibili e trattati allo stesso modo.
+
+`GET` (`session_items_service.list_orphaned_session_items`) calcola l'insieme
+dei `sessionItemId` ancora referenziati con **una sola** query
+(`sessions.distinct("items.sessionItemId")`, non un giro per sessione), poi
+filtra `session_items` per esclusione. Ogni voce riporta `scenarioId`,
+`protocol`, `environment` e `createdAt` — informazione sufficiente per
+decidere se conservare o cancellare senza aprire il documento singolarmente.
+`createdAt` **non è un campo persistito**: nessuna entità di questo progetto
+ne ha uno esplicito. Deriva da `ObjectId.generation_time` (i primi 4 byte di
+ogni `ObjectId` Mongo codificano un timestamp Unix), quindi è disponibile
+gratuitamente per ogni `SessionItem` mai creato, compresi quelli precedenti a
+questo endpoint, senza migrazione né scrittura aggiuntiva.
+
+`DELETE` (`session_items_service.delete_orphaned_session_items`) **ricalcola**
+l'insieme al momento della chiamata — non accetta né riusa un elenco da una
+precedente `GET`, che nel frattempo potrebbe essere diventato stale (un
+rilancio può aver riassegnato uno di quegli item). Cancella un item alla
+volta tramite `delete_session_item`, la stessa funzione dietro
+`DELETE /session-items/{id}`: il vincolo di integrità referenziale (409 se un
+item è ancora referenziato, §3.3) resta quindi attivo **anche qui**, senza
+duplicarne la logica. Nella finestra — strettissima, Mongo standalone non ha
+transazioni multi-documento (sopra) — fra il calcolo della lista e la
+cancellazione di ciascun item, un item riassegnato produce un `ConflictError`
+per quel singolo id: viene registrato e saltato, non lasciato bloccare l'intera
+operazione per un caso che per costruzione non dovrebbe mai verificarsi.
+Risponde sempre `200` con `{"count": N, "ids": [...]}`, anche a `N=0`: nessun
+orfano da cancellare non è un errore.
+
+Verificato con un test reale: due `Session` che condividono lo stesso
+`SessionItem` X — cancellata la prima, X non compare fra gli orfani (ancora
+referenziato dalla seconda); cancellata anche la seconda, X compare; chiamato
+`DELETE /orphaned`, X viene rimosso (confermato anche con
+`GET /session-items/{X}` → `404`) e non ricompare in una `GET /orphaned`
+successiva.
 
 ### 5.6 Motore di misura "chrome" (Playwright + CDP)
 

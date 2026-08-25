@@ -5,11 +5,14 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
+from bson import ObjectId
+
 from app.core.errors import ConflictError, DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SESSION_ITEMS, SESSIONS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
 from app.models.session_item import (
+    OrphanedSessionItem,
     SessionItem,
     SessionItemBatchCreate,
     SessionItemCreate,
@@ -38,6 +41,105 @@ async def list_session_items() -> list[SessionItem]:
     except PyMongoError as exc:
         raise DatabaseError("Impossibile leggere i session item dal database.") from exc
     return [SessionItem.model_validate(document) for document in documents]
+
+
+async def list_orphaned_session_items() -> list[OrphanedSessionItem]:
+    """Elenca i session item non referenziati da nessuna Session esistente.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        La lista degli ``OrphanedSessionItem`` (§5.5), ciascuno con
+        ``createdAt`` derivato dal proprio ``ObjectId`` — nessun campo di
+        creazione è persistito su ``SessionItem`` (vedi il modello).
+
+    Fa:
+        Calcola l'insieme dei ``sessionItemId`` ancora referenziati con
+        ``sessions.distinct("items.sessionItemId")`` — una singola query che
+        raccoglie i riferimenti di **tutte** le sessioni in un colpo solo,
+        invece di una per sessione — poi filtra ``session_items`` per
+        esclusione (``_id $nin`` quell'insieme). Un ``SessionItem`` mai
+        referenziato da nessuna sessione (creato ma mai raggruppato in una
+        `Session`, non solo uno diventato orfano dopo una cancellazione) è
+        comunque orfano per questa definizione: non è mai stato "in uso", il
+        che è coerente con quanto un rilancio (§3.3) intende per riutilizzo —
+        serve un item **raggiungibile da una sessione**, a prescindere dal
+        perché non lo sia (mai assegnato, o assegnato e poi liberato).
+    """
+    items_collection = get_collection(SESSION_ITEMS)
+    sessions_collection = get_collection(SESSIONS)
+    try:
+        referenced_ids = await sessions_collection.distinct("items.sessionItemId")
+        referenced_object_ids = [
+            ObjectId(raw_id) for raw_id in referenced_ids if ObjectId.is_valid(raw_id)
+        ]
+        documents = await items_collection.find(
+            {"_id": {"$nin": referenced_object_ids}}
+        ).to_list(length=None)
+    except PyMongoError as exc:
+        raise DatabaseError("Impossibile calcolare i session item orfani.") from exc
+
+    return [
+        OrphanedSessionItem.model_validate(
+            {**document, "createdAt": document["_id"].generation_time}
+        )
+        for document in documents
+    ]
+
+
+async def delete_orphaned_session_items() -> list[str]:
+    """Cancella tutti i session item correntemente orfani.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        Gli ``id`` effettivamente cancellati (stringa esadecimale).
+
+    Fa:
+        Ricalcola l'insieme degli orfani **al momento della chiamata**
+        (chiama ``list_orphaned_session_items`` internamente, non accetta una
+        lista dall'esterno): un risultato di una precedente ``GET`` potrebbe
+        essere stale se nel frattempo una nuova sessione ha riassegnato uno
+        di quegli item (§3.3, rilancio/riproposizione).
+
+        Cancella **un item alla volta tramite ``delete_session_item``**,
+        non con un ``delete_many`` diretto: riusa così lo stesso controllo di
+        integrità referenziale invece di duplicarlo, e resta corretta anche
+        nella finestra — strettissima ma non nulla, Mongo standalone non ha
+        transazioni multi-documento (§5.5) — fra il calcolo della lista e la
+        cancellazione: se un item viene riassegnato a una sessione proprio in
+        quell'istante, ``delete_session_item`` solleva ``ConflictError`` per
+        quel singolo id, che viene registrato e saltato invece di far fallire
+        l'intera operazione di manutenzione per un caso che, per costruzione,
+        non dovrebbe mai verificarsi.
+    """
+    orphaned = await list_orphaned_session_items()
+    deleted_ids: list[str] = []
+    for item in orphaned:
+        try:
+            await delete_session_item(item.id)
+        except ConflictError:
+            logger.warning(
+                "SessionItem '%s' riassegnato a una sessione fra il calcolo degli "
+                "orfani e la cancellazione: saltato.",
+                item.id,
+            )
+            continue
+        except NotFoundError:
+            # Già cancellato (es. da una chiamata concorrente a questo stesso
+            # endpoint): non è un errore da segnalare, il risultato voluto —
+            # l'item non è più nel database — è comunque raggiunto.
+            logger.warning(
+                "SessionItem '%s' già cancellato prima di questa chiamata: saltato.",
+                item.id,
+            )
+            continue
+        deleted_ids.append(item.id)
+
+    logger.info("SessionItem orfani cancellati: %d", len(deleted_ids))
+    return deleted_ids
 
 
 async def get_session_item(session_item_id: str) -> SessionItem:
