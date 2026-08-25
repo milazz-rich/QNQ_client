@@ -11,6 +11,7 @@ from app.core.cors import setup_cors
 from app.core.errors import register_exception_handlers
 from app.core.session_logging import LOG_FORMAT, setup_session_logging
 from app.db.mongo import close_mongo_connection, connect_to_mongo, ensure_indexes
+from app.services import sessions_service
 from app.services.measurement.firefox_client import cleanup_stale_run_profiles
 from app.routers import (
     clients,
@@ -37,18 +38,24 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         Un async context manager che cede il controllo mentre l'app è in esecuzione.
 
     Fa:
-        All'avvio apre la connessione a MongoDB, verifica gli indici della
-        collezione ``results`` (operazione idempotente, vedi
-        ``ensure_indexes``), installa l'handler che cattura su file i log di
-        ogni sessione (§5.10) e rimuove le copie temporanee di profilo Firefox
-        rimaste da un'esecuzione interrotta bruscamente (§5.7): all'avvio
-        nessuna misura è in corso, quindi tutto ciò che resta in
-        ``.runtime/firefox/runs/`` è per definizione un residuo. Allo
-        spegnimento chiude la connessione.
+        All'avvio apre la connessione a MongoDB, verifica gli indici delle
+        collezioni ``results`` e ``sessions`` (operazione idempotente, vedi
+        ``ensure_indexes``) — incluso l'indice unico parziale che vieta più di
+        una ``Session`` ``running`` insieme (§5.1) — installa l'handler che
+        cattura su file i log di ogni sessione (§5.10), riporta a ``failed``
+        qualunque ``Session`` trovata ancora ``running`` (residuo di un crash
+        o riavvio precedente: nessun processo la sta eseguendo davvero in
+        questo avvio, §5.1) e rimuove le copie temporanee di profilo Firefox
+        rimaste da un'esecuzione interrotta bruscamente (§5.7) — stesso
+        principio del recupero sessioni, applicato al filesystem invece che al
+        database: nessuna misura può essere in corso quando il processo sta
+        appena nascendo, quindi ogni residuo trovato a questo punto è per
+        definizione anomalo. Allo spegnimento chiude la connessione.
     """
     await connect_to_mongo()
     await ensure_indexes()
     setup_session_logging()
+    await sessions_service.recover_interrupted_sessions()
     cleanup_stale_run_profiles()
     yield
     await close_mongo_connection()

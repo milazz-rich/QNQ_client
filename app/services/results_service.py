@@ -33,7 +33,7 @@ MAX_PAGE_SIZE = 200
 def build_filter_query(
     scenario_path: str | None = None,
     session_item_ids: list[str] | None = None,
-    session_id: str | None = None,
+    session_ids: list[str] | None = None,
     client_id: str | None = None,
     scenario_id: str | None = None,
     target_id: str | None = None,
@@ -43,7 +43,9 @@ def build_filter_query(
     Riceve:
         scenario_path: filtro sul path richiesto (confronto esatto).
         session_item_ids: filtro sui session item che hanno prodotto la misura.
-        session_id: filtro sulla singola esecuzione di sessione.
+        session_ids: filtro su una o più esecuzioni di sessione (unione, non
+            intersezione: un risultato entra se la sua sessione è **una
+            qualunque** di quelle elencate).
         client_id: filtro sul motore di misura.
         scenario_id: filtro sullo scenario.
         target_id: filtro sul server sotto test.
@@ -55,18 +57,23 @@ def build_filter_query(
         Condivisa da ``list_results`` e ``aggregate_results`` perché i due
         endpoint devono accettare **esattamente** gli stessi filtri: tenerne
         due copie li farebbe divergere alla prima aggiunta. I filtri si
-        combinano in AND. Gli id sono confrontati come stringhe, coerentemente
-        con come il runner li salva. Una lista di id vuota vale "nessun
-        filtro", non "nessun risultato", perché deriva da una query string
-        vuota.
+        combinano in AND (fra campi diversi); `session_ids` e
+        `session_item_ids` sono invece un OR **al loro interno** (`$in`), la
+        semantica naturale di "una di queste sessioni/questi item". Gli id
+        sono confrontati come stringhe, coerentemente con come il runner li
+        salva. Una lista di id vuota vale "nessun filtro", non "nessun
+        risultato", perché deriva da una query string vuota — un singolo id
+        produce comunque un `$in` con un solo elemento, che Mongo tratta come
+        un confronto diretto senza differenze di piano di esecuzione rispetto
+        a un match singolo.
     """
     query: dict[str, object] = {}
     if scenario_path:
         query["scenarioPath"] = scenario_path
     if session_item_ids:
         query["sessionItemId"] = {"$in": session_item_ids}
-    if session_id:
-        query["sessionId"] = session_id
+    if session_ids:
+        query["sessionId"] = {"$in": session_ids}
     if client_id:
         query["clientId"] = client_id
     if scenario_id:
@@ -79,7 +86,7 @@ def build_filter_query(
 async def list_results(
     scenario_path: str | None = None,
     session_item_ids: list[str] | None = None,
-    session_id: str | None = None,
+    session_ids: list[str] | None = None,
     client_id: str | None = None,
     scenario_id: str | None = None,
     target_id: str | None = None,
@@ -93,11 +100,13 @@ async def list_results(
             scenario (confronto esatto sul path richiesto).
         session_item_ids: se valorizzata, restituisce solo i risultati prodotti
             da quei session item.
-        session_id: se valorizzato, restituisce solo i risultati prodotti da
-            quella singola esecuzione di sessione. È il filtro **preferito** per
-            "i risultati di questa sessione": diretto e senza l'ambiguità di
-            ``session_item_ids``, dato che uno stesso ``SessionItem`` può essere
-            condiviso fra più sessioni.
+        session_ids: se valorizzata, restituisce l'**unione** dei risultati
+            prodotti da una o più esecuzioni di sessione. È il filtro
+            **preferito** per "i risultati di queste sessioni": diretto e
+            senza l'ambiguità di ``session_item_ids``, dato che uno stesso
+            ``SessionItem`` può essere condiviso fra più sessioni. Una lista
+            con un solo id si comporta come il precedente filtro a singola
+            sessione.
         client_id: se valorizzato, restituisce solo i risultati prodotti da quel
             motore di misura (confronto fra curl, Chrome e Firefox).
         scenario_id: se valorizzato, filtra per scenario (riferimento diretto,
@@ -117,12 +126,13 @@ async def list_results(
         con ``skip``/``limit`` per la pagina. L'ordinamento per ``time``
         crescente (con ``_id`` come discriminante) è ciò che rende la
         paginazione stabile: senza un ordine totale, pagine successive
-        potrebbero ripetere o saltare documenti.
+        potrebbero ripetere o saltare documenti — la pagina resta stabile
+        anche quando la query unisce più sessioni.
     """
     query = build_filter_query(
         scenario_path=scenario_path,
         session_item_ids=session_item_ids,
-        session_id=session_id,
+        session_ids=session_ids,
         client_id=client_id,
         scenario_id=scenario_id,
         target_id=target_id,
@@ -149,7 +159,7 @@ async def aggregate_results(
     metric: AggregateMetric,
     scenario_path: str | None = None,
     session_item_ids: list[str] | None = None,
-    session_id: str | None = None,
+    session_ids: list[str] | None = None,
     client_id: str | None = None,
     scenario_id: str | None = None,
     target_id: str | None = None,
@@ -160,8 +170,9 @@ async def aggregate_results(
         group_by: dimensione di raggruppamento (target, environment, client,
             scenario).
         metric: metrica di cui calcolare la media (total, ttfb, kb).
-        scenario_path, session_item_ids, session_id, client_id, scenario_id,
-            target_id: gli stessi filtri accettati da ``list_results``.
+        scenario_path, session_item_ids, session_ids, client_id, scenario_id,
+            target_id: gli stessi filtri accettati da ``list_results``
+            (``session_ids`` in unione, vedi sopra).
 
     Restituisce:
         La coppia ``(gruppi, misure considerate)``. I gruppi sono ordinati per
@@ -195,7 +206,7 @@ async def aggregate_results(
     match_stage = build_filter_query(
         scenario_path=scenario_path,
         session_item_ids=session_item_ids,
-        session_id=session_id,
+        session_ids=session_ids,
         client_id=client_id,
         scenario_id=scenario_id,
         target_id=target_id,

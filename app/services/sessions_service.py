@@ -3,17 +3,101 @@
 import logging
 
 from pymongo import ReturnDocument
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from app.core import session_logging
-from app.core.errors import DatabaseError, NotFoundError, ValidationError
+from app.core.errors import ConflictError, DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SESSIONS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
 from app.models.session import RunStatus, Session, SessionCreate, SessionUpdate
-from app.services import results_service
+from app.services import results_service, session_items_service
 
 logger = logging.getLogger(__name__)
+
+
+async def get_running_session() -> Session | None:
+    """Cerca una Session con ``status="running"``, se esiste.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        La ``Session`` in esecuzione, oppure ``None`` se nessuna lo è.
+
+    Fa:
+        Usata per un controllo applicativo **prima** di tentare di avviare
+        un'altra sessione, per poter rispondere con un messaggio che nomina
+        la sessione bloccante invece di un generico conflitto. Da sola non
+        basta a escludere una race fra due avvii concorrenti: la garanzia
+        atomica finale è l'indice unico parziale su ``sessions.status``
+        (``ix_single_running_session``, vedi ``db.mongo.ensure_indexes``),
+        che ``set_status``/``update_session`` traducono in ``ConflictError``
+        se la scrittura arriva comunque a collidere.
+    """
+    collection = get_collection(SESSIONS)
+    try:
+        document = await collection.find_one({"status": RunStatus.RUNNING.value})
+    except PyMongoError as exc:
+        raise DatabaseError("Impossibile verificare le sessioni in esecuzione.") from exc
+    return Session.model_validate(document) if document is not None else None
+
+
+async def recover_interrupted_sessions() -> int:
+    """Riporta a ``failed`` le Session rimaste ``running`` da un crash precedente.
+
+    Riceve:
+        Nulla.
+
+    Restituisce:
+        Il numero di sessioni recuperate.
+
+    Fa:
+        Invocata **all'avvio** dal lifespan di FastAPI (`app/main.py`), nello
+        stesso punto in cui `firefox_client.cleanup_stale_run_profiles` ripulisce
+        le directory orfane (§5.7): un processo che sta appena avviandosi non
+        sta eseguendo nessuna sessione, quindi qualunque documento con
+        ``status="running"`` a questo punto è per definizione un residuo di
+        un'interruzione anomala (crash, `SIGKILL`, riavvio) — nessun
+        `session_runner.start_session` può essere realmente in corso nel
+        processo che sta nascendo ora.
+
+        Senza questo passo la sessione resterebbe bloccata in ``running`` per
+        sempre: nessun codice esistente la riporta indietro spontaneamente, e
+        l'indice unico parziale impedirebbe anche l'avvio di qualunque nuova
+        sessione finché quella fantasma occupa lo status. Scrive anche
+        ``note``, così chi la trova già ``failed`` sa che **nessun item ha
+        realmente fallito una misura** — a differenza del significato abituale
+        di ``failed`` (§5.4) — e non la scambia per un dato di misura valido.
+
+        Usa ``update_many`` invece di passare da ``set_status`` (che
+        aggiornerebbe una sessione alla volta): non c'è ambiguità da
+        risolvere sessione per sessione, e più documenti ``running``
+        contemporaneamente sono già di per sé la prova che l'indice unico
+        (introdotto insieme a questo meccanismo) non esisteva ancora quando
+        sono stati scritti.
+    """
+    collection = get_collection(SESSIONS)
+    note = (
+        "Sessione riportata a 'failed' dal recupero da crash all'avvio: "
+        "era ancora 'running' quando il processo è ripartito, quindi "
+        "l'esecuzione precedente si è interrotta in modo anomalo (crash o "
+        "riavvio) prima di poter completare o fallire regolarmente. "
+        "Nessun item ha necessariamente fallito una misura."
+    )
+    try:
+        result = await collection.update_many(
+            {"status": RunStatus.RUNNING.value},
+            {"$set": {"status": RunStatus.FAILED.value, "note": note}},
+        )
+    except PyMongoError as exc:
+        raise DatabaseError("Impossibile recuperare le sessioni interrotte.") from exc
+    if result.modified_count:
+        logger.warning(
+            "Recuperate %d sessioni rimaste 'running' da un'interruzione anomala.",
+            result.modified_count,
+        )
+    return result.modified_count
 
 
 async def list_sessions() -> list[Session]:
@@ -99,6 +183,14 @@ async def update_session(session_id: str, payload: SessionUpdate) -> Session:
         Esegue un ``find_one_and_update`` con ``$set`` sui soli campi presenti
         nella richiesta. Solleva ``NotFoundError`` se la sessione non esiste e
         ``ValidationError`` se il payload non contiene alcun campo.
+
+        ``SessionUpdate`` include ``status``, quindi è un secondo modo (oltre
+        a ``POST /sessions/{id}/start``) di portare una sessione a
+        ``RUNNING``: soggetto alla stessa garanzia atomica, non solo al
+        controllo del router di `/start`. Una violazione dell'indice unico
+        parziale ``ix_single_running_session`` produce ``ConflictError``
+        (409) invece di ``DatabaseError``, con lo stesso significato di
+        ``set_status``.
     """
     collection = get_collection(SESSIONS)
     object_id = to_object_id(session_id, "Id della sessione")
@@ -112,6 +204,12 @@ async def update_session(session_id: str, payload: SessionUpdate) -> Session:
             {"$set": changes},
             return_document=ReturnDocument.AFTER,
         )
+    except DuplicateKeyError as exc:
+        raise ConflictError(
+            "Un'altra sessione è già in esecuzione: le misure di questo "
+            "progetto sono sequenziali per metodologia (AGENTS.md §5.1), non "
+            "è possibile eseguirne due contemporaneamente."
+        ) from exc
     except PyMongoError as exc:
         raise DatabaseError("Impossibile aggiornare la sessione.") from exc
     if document is None:
@@ -224,11 +322,29 @@ async def set_status(session_id: str, status: RunStatus) -> None:
     Fa:
         Aggiorna il solo campo ``status``. Usata dal session runner durante
         l'esecuzione in background.
+
+        Solleva ``ConflictError`` (409) invece di ``DatabaseError`` se la
+        scrittura viola l'indice unico parziale ``ix_single_running_session``
+        (`db.mongo.ensure_indexes`): può succedere solo quando ``status`` è
+        ``RUNNING`` e un'altra sessione lo è già — riscrivere ``RUNNING`` sulla
+        **stessa** sessione che ce l'ha già non viola l'indice (stesso
+        documento, stesso valore), quindi la doppia chiamata già presente in
+        `session_runner.start_session` (router + runner) resta innocua. È il
+        backstop atomico al controllo applicativo di
+        ``get_running_session``: chiude la finestra di race fra due avvii
+        concorrenti su sessioni diverse che quel controllo, da solo, non può
+        escludere.
     """
     collection = get_collection(SESSIONS)
     object_id = to_object_id(session_id, "Id della sessione")
     try:
         await collection.update_one({"_id": object_id}, {"$set": {"status": status.value}})
+    except DuplicateKeyError as exc:
+        raise ConflictError(
+            "Un'altra sessione è già in esecuzione: le misure di questo "
+            "progetto sono sequenziali per metodologia (AGENTS.md §5.1), non "
+            "è possibile eseguirne due contemporaneamente."
+        ) from exc
     except PyMongoError as exc:
         raise DatabaseError("Impossibile aggiornare lo stato della sessione.") from exc
 

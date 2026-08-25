@@ -117,17 +117,41 @@ async def start_session(
         polling su ``GET /api/sessions/{id}``.
 
     Fa:
-        Verifica che la sessione esista, che non sia già in esecuzione
-        (``409 CONFLICT``) e che abbia almeno un item (``422``), poi accoda
-        ``session_runner.start_session``. Lo stato viene portato a ``running``
-        prima di rispondere, non dentro il task, così che un polling immediato
-        non veda ancora ``pending`` e creda che l'avvio sia fallito.
+        Verifica che la sessione esista, che non sia già in esecuzione essa
+        stessa (``409 CONFLICT``), che nessun'**altra** sessione lo sia — le
+        misure sono sequenziali per metodologia, mai due sessioni in
+        parallelo (§5.1 di AGENTS.md) — e che abbia almeno un item (``422``),
+        poi accoda ``session_runner.start_session``. Lo stato viene portato a
+        ``running`` prima di rispondere, non dentro il task, così che un
+        polling immediato non veda ancora ``pending`` e creda che l'avvio sia
+        fallito.
+
+        Il controllo su un'altra sessione già in esecuzione è a due livelli:
+        ``sessions_service.get_running_session`` qui sotto è il controllo
+        applicativo, che produce un messaggio leggibile con il nome della
+        sessione bloccante; da solo lascerebbe però una finestra di race fra
+        due avvii concorrenti su sessioni diverse (entrambi passerebbero il
+        controllo prima che l'uno o l'altro scriva). La garanzia vera è
+        l'indice unico parziale su ``sessions.status`` (§5.1): se la
+        race si materializza, ``sessions_service.set_status`` la traduce
+        comunque in ``ConflictError``, solo con un messaggio più generico
+        perché a quel punto non sappiamo più quale sessione ha vinto.
     """
     from app.core.errors import ValidationError
 
     session = await sessions_service.get_session(session_id)
     if session.status is RunStatus.RUNNING:
         raise ConflictError(f"La sessione '{session_id}' è già in esecuzione.")
+
+    running = await sessions_service.get_running_session()
+    if running is not None:
+        raise ConflictError(
+            f"Impossibile avviare '{session_id}': la sessione '{running.name}' "
+            f"({running.id}) è già in esecuzione. Le misure di questo progetto "
+            "sono sequenziali per metodologia (AGENTS.md §5.1): non è "
+            "possibile eseguirne due contemporaneamente."
+        )
+
     if not session.items:
         raise ValidationError(f"La sessione '{session_id}' non contiene item da eseguire.")
 

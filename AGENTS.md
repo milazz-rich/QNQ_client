@@ -283,6 +283,7 @@ client**, declinato su più scenari, protocolli e ambienti.
 | `status`       | `"pending"\|"running"\|"completed"\|"failed"` | default `pending`; `failed` se almeno un item termina `failed` |
 | `currentIndex` | `int`                                    | ≥ 0, indice dell'item in esecuzione |
 | `items`        | `SessionProgressItem[]`                  | embedded, vedi sotto                |
+| `note`         | `str \| null`                            | sola lettura, non in `SessionCreate`/`SessionUpdate`; valorizzata solo dal recupero da crash (§5.1) |
 
 `SessionProgressItem` (documento embedded, non una collezione):
 
@@ -773,6 +774,77 @@ per garantire. Motivata da un rate limiter per-IP verificato empiricamente su
 OpenLiteSpeed (§5.3): senza pausa, ripetizioni ravvicinate su quel target
 ricevevano regolarmente `403` pur negoziando il protocollo corretto.
 
+#### Vincolo: al più una Session `running` alla volta
+
+La sequenzialità **dentro** una sessione (sopra) non basta da sola a garantire
+misure non falsate: due `Session` **diverse** avviate in parallelo
+contenderebbero comunque la banda, con lo stesso effetto che la pausa fra
+ripetizioni esiste per evitare. Il vincolo è quindi a livello di intera
+collezione `sessions`, non solo di singola sessione, con due livelli — lo
+stesso schema già usato per l'integrità referenziale dei `SessionItem` (§5.5)
+e per la pulizia dei profili Firefox orfani (§5.7): un controllo applicativo
+per un errore leggibile, più una garanzia atomica di backstop per la race che
+il controllo da solo non può escludere.
+
+* **Controllo applicativo.** `POST /sessions/{id}/start` interroga
+  `sessions_service.get_running_session` prima di avviare: se un'altra
+  sessione è già `running`, risponde `409 CONFLICT` nominandola per nome e id
+  ("la sessione 'X' (id) è già in esecuzione"), invece di un conflitto
+  generico. Lo stesso vale se è la sessione stessa a essere già `running`
+  (comportamento preesistente, invariato).
+* **Garanzia atomica.** Un indice unico **parziale** su `sessions.status`
+  (`ix_single_running_session`, creato da `db.mongo.ensure_indexes` come
+  quelli su `results`, §5.9) vieta a livello di database più di un documento
+  con `status="running"` contemporaneamente — parziale perché si applica solo
+  ai documenti che soddisfano quel filtro, non all'intera collezione, quindi
+  non limita in alcun modo quanti documenti esistano con altri stati.
+  `sessions_service.set_status` e `update_session` traducono la violazione
+  (`DuplicateKeyError` di Mongo) in `ConflictError` (409), con lo stesso
+  significato del controllo applicativo ma un messaggio necessariamente più
+  generico, perché a quel punto non è più noto quale sessione ha vinto la
+  race. Questo secondo livello copre anche `PUT /sessions/{id}` con
+  `{"status": "running"}`: `SessionUpdate` espone `status`, quindi è un
+  secondo modo — oltre a `/start` — di portare una sessione a `running`, e
+  deve rispettare lo stesso vincolo.
+
+Verificato con un test reale: avviata una sessione da 30 ripetizioni, un
+secondo avvio (sessione diversa) mentre la prima era ancora `running` ha
+prodotto `409` con il nome della prima sessione nel messaggio; lo stesso
+tentativo via `PUT .../status=running` ha prodotto `409` dal backstop
+atomico; terminata la prima sessione, il secondo avvio è riuscito
+regolarmente.
+
+#### Recupero da crash: nessuna Session resta bloccata in `running`
+
+Se il processo si interrompe (crash, `SIGKILL`, riavvio) mentre una sessione
+è `running`, nulla la riporta indietro spontaneamente — e senza rimedio
+resterebbe `running` per sempre, bloccando anche l'indice unico sopra: nessuna
+nuova sessione potrebbe più partire, scambiando un fantasma per un'esecuzione
+reale.
+
+`sessions_service.recover_interrupted_sessions`, invocata **all'avvio** dal
+lifespan di `app/main.py` (stesso punto in cui
+`firefox_client.cleanup_stale_run_profiles` ripulisce le directory orfane di
+profilo, §5.7), riporta a `status="failed"` ogni `Session` trovata ancora
+`running`. Il ragionamento è identico a quello della pulizia dei profili: un
+processo che sta appena nascendo non sta eseguendo nessuna sessione, quindi
+qualunque `running` trovato a questo punto è per costruzione un residuo di
+un'interruzione anomala, mai un'esecuzione realmente in corso.
+
+Scrive anche `Session.note` (campo di sola lettura dall'API — assente da
+`SessionCreate`/`SessionUpdate`, quindi non impostabile dall'esterno) con un
+testo che spiega l'interruzione: senza, una sessione recuperata sarebbe
+indistinguibile da una fallita per un motivo di misura reale (§5.4), quando
+invece **nessun item ha necessariamente fallito una misura** — l'esecuzione
+è stata interrotta da un evento del tutto estraneo alla metodologia.
+
+Verificato con un test reale: una sessione già `completed` forzata a
+`running` direttamente nel database (a simulare lo stato lasciato da un
+crash), riavvio del processo, log di avvio `Recuperate 1 sessioni rimaste
+'running'...`, sessione tornata `failed` con la nota attesa via
+`GET /sessions/{id}`. Verificata anche l'idempotenza: un riavvio successivo
+senza sessioni `running` non recupera nulla (`recovered == 0`).
+
 ### 5.2 Comando curl
 
 ```
@@ -858,6 +930,36 @@ Esiste `--http3-only` per la modalità strict (fallire invece di ripiegare): non
 (tramite `actualProto`), non impedirlo — mentre un fallback fuori da questi
 due protocolli, o una risposta di errore, sono comunque un fallimento,
 rilevato tramite `status="failed"`.
+
+#### Conferma via cattura di rete (Wireshark)
+
+Verificato pacchetto per pacchetto su una sessione dedicata
+(curl/OpenLiteSpeed/HTTP2/KVM, 40 ripetizioni, nessun altro traffico QNQ
+concorrente). Filtro Wireshark: `http2.headers.status == 403`.
+
+* **9 pacchetti di risposta con codice `403`**, isolati dal filtro.
+* **Corrispondenza esatta con il log applicativo** della stessa sessione: 9
+  fallimenti distinti per `idx` nel log, 9 pacchetti nella cattura — nessuna
+  discrepanza, a differenza della verifica lsquic (sopra), dove una probabile
+  ritrasmissione aveva causato uno scarto di un'unità fra le due fonti.
+* **Corpo della risposta confermato** via `Follow HTTP/2 Stream`:
+  `content-length: 1240`, pagina HTML standard "403 Forbidden" di LiteSpeed —
+  firma identica a quella già documentata nell'indagine originale su questo
+  rate limiter.
+* **`alt-svc: h3=":9443"` nell'header di risposta**: conferma diretta che la
+  correzione dell'Alt-Svc applicata su `QNQ_server` (che originariamente
+  annunciava la porta interna `:443` invece di quella esterna reale) è
+  tuttora corretta e attiva su questo endpoint KVM.
+* **Confronto statistico col tasso storico** della campagna principale sulla
+  stessa combinazione (curl/OpenLiteSpeed/HTTP2/KVM): `22,5%` in questa
+  sessione (9/40) contro `15,0%` nella campagna (18/120 — campione più
+  ampio). Fisher exact test: `p = 0,33` — differenza **non** statisticamente
+  significativa, pienamente compatibile con normale variabilità campionaria
+  su un campione ridotto. A differenza del fallimento lsquic (dove la stessa
+  verifica aveva mostrato una differenza significativa, §5.6), qui la
+  cattura di rete non solleva alcuna anomalia da segnalare: il tasso storico
+  resta pienamente confermato, senza bisogno di ipotizzare un'interferenza
+  della cattura stessa sul risultato.
 
 ### 5.4 Fallimenti
 
@@ -1049,14 +1151,85 @@ catturata, vedi tabella sopra): produce un `Measurement` con
 crash, nessuna sessione bloccata, nessun dato silenziosamente perso o
 scambiato per una misura valida.
 
+#### Fallimento noto: lsquic — `ERR_QUIC_PROTOCOL_ERROR` (OpenLiteSpeed, HTTP/3)
+
+Il fallimento più frequente della campagna di misure reali del 2026-08-23/24
+(§5.10, 4320 misure totali): richieste **HTTP/3** verso OpenLiteSpeed che
+falliscono con `net::ERR_QUIC_PROTOCOL_ERROR` durante `page.goto()`, catturato
+dallo stesso percorso di eccezione di `ERR_CERT_VERIFIER_CHANGED` e
+`ERR_CONNECTION_CLOSED` sotto, ma un codice d'errore distinto e — a differenza
+di quei due — non raro:
+
+| Ambiente | Fallimenti | Tasso |
+| -------- | ---------- | ----- |
+| KVM | 31 / 120 | 25,8% |
+| Docker | 28 / 120 | 23,3% |
+| Combinato | 59 / 240 | 24,6% |
+
+Solo su **Chrome**: curl, sullo stesso target e protocollo (17 fallimenti
+HTTP/3 su OpenLiteSpeed nella stessa campagna), non mostra mai questo errore
+— i suoi fallimenti sono sempre `403` da rate limiter (§5.3), mai un errore
+QUIC. 58 delle 59 occorrenze sono `ERR_QUIC_PROTOCOL_ERROR` letterale; la
+59ª è una variante di superficie dello stesso guasto — Chrome mostra la
+propria pagina d'errore interna (`chrome-error://chromewebdata/`),
+intercettata dal validatore di catena di navigazione (sotto, "Dati estratti
+dal CDP") invece che dall'eccezione diretta — ma stesso target, stesso
+protocollo, stessa sessione: non un fallimento a parte.
+
+**Causa non determinata con certezza sul lato applicativo.** Il nome (lsquic)
+riflette l'implementazione QUIC lato server di OpenLiteSpeed; nessuna
+indagine multi-via sul lato client è stata condotta, perché il sospetto
+principale è lato server — confermato dalla cattura di rete sotto.
+
+##### Conferma via cattura di rete (Wireshark)
+
+Verificato pacchetto per pacchetto su una sessione dedicata
+(Chrome/OpenLiteSpeed/HTTP3/KVM, 25 ripetizioni, nessun altro traffico QNQ
+concorrente). Filtro Wireshark: `quic.frame_type == 0x1c and
+quic.cc.error_code == 1`.
+
+* **14 pacchetti `CONNECTION_CLOSE`** con `error_code=INTERNAL_ERROR`, tutti
+  inviati dal **server** al livello di pacchetto `Initial` (`PKN: 0`) — il
+  fallimento avviene al primissimo pacchetto di risposta del server, non
+  durante lo scambio del Protected Payload come la diagnosi originale (via
+  net-log di Chrome, senza visibilità sui pacchetti) aveva lasciato intendere.
+  Il `Reason Phrase` del frame è vuoto in tutti e 14 i casi: nessun dettaglio
+  testuale aggiuntivo dal server.
+* **Corrispondenza con il log applicativo.** Il log della stessa sessione
+  riporta **13** fallimenti distinti per `idx`, contro i 14 pacchetti di rete.
+  La differenza di un'unità è verosimilmente una ritrasmissione dello stesso
+  `CONNECTION_CLOSE` (comune in QUIC quando l'ACK non arriva in tempo), non un
+  fallimento aggiuntivo non tracciato: le due fonti — log applicativo via CDP
+  e cattura di rete indipendente — si confermano a vicenda.
+* **Tasso di questa sessione più alto dello storico, con nota metodologica.**
+  13/25 = 52% di fallimento in questa sessione, contro il 25,8% osservato
+  sulla stessa identica combinazione (Chrome/OpenLiteSpeed/HTTP3/KVM) nella
+  campagna principale (31/120 — campione più ampio e quindi più affidabile).
+  Fisher exact test fra i due campioni: `p = 0,0156` — differenza
+  statisticamente significativa, non spiegabile come normale variabilità
+  campionaria. Causa non determinata con certezza; ipotesi più probabile: il
+  carico aggiuntivo di CPU introdotto dalla cattura Wireshark attiva durante
+  questa sessione specifica può aver alterato il timing delle richieste
+  Chrome, aumentando la probabilità della race condition che innesca il bug
+  lsquic — coerente con la decisione, presa altrove nel progetto, di non
+  includere le sessioni con Wireshark attivo nel dataset ufficiale della tesi.
+
+**Il tasso storico di riferimento resta `~25%`**, invariato da questa
+verifica: è quello derivato dalla campagna principale su un campione più
+ampio (2.640 tentativi sull'aggregato Chrome/OpenLiteSpeed/HTTP3) e senza
+l'interferenza della cattura di rete, ed è quello valido per l'analisi
+comparativa nella tesi. Il 52% osservato con Wireshark attivo è una conferma
+indipendente della *natura* del fallimento (pacchetto per pacchetto, lato
+server, `INTERNAL_ERROR` al primo `Initial`), non una revisione del suo
+*tasso* atteso in condizioni normali.
+
 #### Fallimento noto: `ERR_CONNECTION_CLOSED` su HTTP/2
 
 Osservato 3 volte nella campagna di misure reali del 2026-08-23/24 (§5.10,
 4320 misure totali): `net::ERR_CONNECTION_CLOSED` durante `page.goto()` su
-richieste **HTTP/2** (non HTTP/3 — non è quindi lo stesso fenomeno del
-paragrafo precedente, che riguarda solo `ERR_CERT_VERIFIER_CHANGED`, né la
-strumentazione lsquic descritta nel report della campagna, che riguarda solo
-richieste HTTP/3 su OpenLiteSpeed).
+richieste **HTTP/2** (non HTTP/3 — non è quindi lo stesso fenomeno lsquic
+descritto sopra, che riguarda solo richieste HTTP/3 su OpenLiteSpeed, né lo
+stesso di `ERR_CERT_VERIFIER_CHANGED` nel paragrafo precedente).
 
 | Target | Ambiente | Scenario |
 | ------ | -------- | -------- |
@@ -1498,6 +1671,70 @@ prima: un retry nascosto violerebbe l'invariante di connessione a freddo. Il
 dato aggiornato serve a chi pianifica una cattura Wireshark mirata (vedi il
 report della campagna) più che a giustificare un intervento sul codice.
 
+**Indagine di rete (Wireshark): la causa non è una race di persistenza sul
+profilo.** Due occorrenze reali (sessione dedicata
+`wireshark-firefox-h2h3-caddy-docker` — Firefox/Caddy/HTTP3/Docker,
+`idx=0` e `idx=61`) sono state analizzate pacchetto per pacchetto per
+verificare un'ipotesi precisa: che la connessione QUIC riuscita osservata
+nella cattura fosse in realtà il precondizionamento del profilo (§5.7 sopra),
+ancora "in corso" ma non ancora "confermato completo" nello stato salvato su
+disco al momento in cui parte la navigazione reale.
+
+**Ipotesi verificata e respinta**, con evidenza diretta, non per deduzione:
+
+* `_ensure_http3_profile` **è già correttamente gated** sulla persistenza su
+  disco: dopo la navigazione di precondizionamento chiude il context (che
+  forza il flush di `AlternateServices.bin`), attende `250ms` e solo allora
+  **rilegge il file** con `_profile_contains_h3_altsvc` prima di restituire
+  l'origin pronta — non si fida della sola response HTTP con l'header
+  `alt-svc`, che potrebbe precedere la scrittura su disco.
+* Più decisivo: per **questa** origin (`https_milaz.it_8444_...`, Caddy
+  Docker) `AlternateServices.bin` risale al **2026-08-23 19:03**, giorni
+  prima che la sessione Wireshark venisse eseguita (2026-08-24 10:03) — il
+  profilo era già pronto e persistito da tempo. Il log della sessione non
+  contiene nessuna riga "Profilo Firefox HTTP/3 precondizionato": il
+  precondizionamento **non è mai partito**, né a `idx=0` né a `idx=61` né in
+  nessun'altra ripetizione di questa sessione. La race ipotizzata richiede che
+  il precondizionamento sia effettivamente in corso: qui non lo è mai stato.
+
+**Cosa mostra davvero la cattura.** In entrambi i casi Firefox avvia — dalla
+copia del profilo già pronto, in un processo nuovo senza connessioni pregresse
+(coerente con l'invariante cold-connection) — un tentativo QUIC verso il
+target informato dall'Alt-Svc persistito, **e quel tentativo riesce**
+(handshake completo, `SETTINGS` scambiati). Pochi millisecondi dopo si
+stabilisce comunque una connessione HTTP/2 separata, ed è quest'ultima a
+portare la richiesta effettivamente misurata. Questo è un segnale **diverso**
+dalla race già documentata più sopra (`storage is not ready`, mitigata dal
+priming DataStorage): quella race, quando si verifica, impedisce a Firefox
+di **tentare** QUIC — zero pacchetti QUIC in cattura, richiesta HTTP/2 diretta.
+Qui invece QUIC parte e riesce: il DataStorage era evidentemente pronto.
+
+**Spiegazione più plausibile: race di connessione interna a Necko, non
+un bug applicativo.** Senza un flag equivalente a `--origin-to-force-quic-on`
+di Chrome (limite già documentato più sotto), Firefox risolve la scelta
+h2/h3 aprendo la connessione QUIC informata dall'Alt-Svc **e**,
+in parallelo, una connessione di backup su TCP/TLS, assegnando la richiesta
+a quella delle due che il livello HTTP interno considera pronta per prima —
+un meccanismo difensivo contro reti che bloccano/filtrano UDP, interno allo
+stack di rete di Firefox (Necko) e non osservabile né controllabile
+dall'API di Playwright usata da questo client. La cattura è coerente con
+questo meccanismo: la connessione di backup vince la corsa per la
+dispacciamento della transazione anche se l'handshake QUIC si conclude a sua
+volta con successo pochi istanti dopo.
+
+**Nessuna correzione applicativa.** Non esiste, in `firefox_client.py` né in
+una preference Firefox verificata (le strade già escluse restano escluse,
+vedi sotto), un segnale osservabile su cui attendere prima di procedere: la
+race è interna al network stack del browser, non uno stato scritto da questo
+codice. Un fix a livello applicativo richiederebbe o (a) forzare HTTP/3 con
+un meccanismo che Firefox non espone, o (b) un retry/riuso di connessione che
+violerebbe l'invariante cold-connection già scartata per lo stesso motivo
+altrove in questo documento. Coerente con il precedente già stabilito per
+`ERR_CERT_VERIFIER_CHANGED` (§5.6): un evento non sistematico (92,5% delle
+misure HTTP/3 su Caddy Docker negozia comunque `h3` correttamente) il cui
+costo di mitigazione supererebbe il beneficio. Resta quindi documentato come
+limite noto, non corretto nel codice.
+
 Le vecchie strade escluse restano escluse: il nome corretto della pref e
 `network.http.http3.enable` (non `enabled`), le mapping Alt-Svc forzate via pref
 non rendono utilizzabile la primissima navigazione a freddo, il warm-up verso il
@@ -1512,11 +1749,11 @@ localhost invece di aggiungere preference casuali o navigazioni QNQ nascoste.
 può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
 `Result`, mentre target, scenari e client restano nell'ordine delle decine.
 
-#### Filtri (si combinano in AND)
+#### Filtri (si combinano in AND; gli id dentro uno stesso filtro in OR)
 
 | Parametro | Significato |
 | --------- | ----------- |
-| `?sessionId=` | i risultati di **una** esecuzione. Filtro **preferito**: diretto e senza ambiguità |
+| `?sessionId=` | i risultati di **una o più** esecuzioni: lista comma-separated, un solo id è il caso degenere. Filtro **preferito**: diretto e senza ambiguità |
 | `?sessionItemIds=` | lista comma-separated; mantenuto per compatibilità ma ambiguo (un `SessionItem` può essere condiviso fra sessioni, §3.3) |
 | `?clientId=` | il motore che ha prodotto la misura, per il confronto fra curl, Chrome e Firefox |
 | `?targetId=` | il server sotto test |
@@ -1526,6 +1763,40 @@ può restituire volumi grandi: una sessione lunga produce facilmente migliaia di
 Gli stessi identici filtri valgono per `GET /api/results/aggregate` (§5.9):
 sono costruiti da un'unica funzione condivisa, `results_service.build_filter_query`,
 proprio perché due copie divergerebbero alla prima aggiunta.
+
+**`sessionId` multi-valore.** Originariamente accettava un solo id. Esteso per
+confrontare più sessioni mirate (es. le sessioni Wireshark
+`wireshark-lsquic-chrome-kvm`/`wireshark-ratelimit-curl-kvm`/
+`wireshark-firefox-h2h3-caddy-docker`) senza dover sommare a mano i risultati
+di chiamate separate. Formato scelto: **CSV sullo stesso nome di parametro**
+(`?sessionId=a,b,c`), non un parametro ripetuto (`?sessionId=a&sessionId=b`)
+né un parametro pluralizzato a parte (`?sessionIds=`):
+
+* Segue la convenzione **già in uso** nel progetto per `sessionItemIds`
+  (lista comma-separated, spacchettata da `_split_ids` in `routers/results.py`
+  scartando i segmenti vuoti) — un filtro multi-valore in più stile FastAPI
+  ripetuto avrebbe introdotto due convenzioni diverse nello stesso router.
+* **Non rompe la compatibilità**: un id singolo senza virgole (`?sessionId=abc`)
+  continua a funzionare identico a prima — non serve toccare nessun chiamante
+  esistente (qnq-ui compreso) per continuare a filtrare per una sola sessione.
+* Gli id si combinano in **OR** (unione): un `Result` entra se la sua
+  `sessionId` è una qualunque di quelle elencate, mai in AND — non avrebbe
+  senso filtrare "risultati che appartengono contemporaneamente a due
+  sessioni diverse", dato che ogni `Result` ha una sola `sessionId`.
+* Lato Mongo: `{"sessionId": {"$in": [...]}}` invece del confronto diretto
+  precedente; un singolo elemento produce lo stesso piano di esecuzione di un
+  match diretto, quindi nessuna regressione di performance sul caso a una
+  sola sessione.
+* Verificato con una chiamata reale su due sessioni della campagna (§5.10):
+  su `GET /api/results`, 480 risultati ciascuna filtrate singolarmente,
+  **960** (la somma esatta) filtrate insieme via `?sessionId=id1,id2`, con
+  entrambi i `sessionId` distinti presenti nelle pagine restituite — non solo
+  l'ultimo valore, non un errore. Su `GET /api/results/aggregate` (che
+  considera solo `status="completed"`, §5.9), 468 e 479 misure singolarmente,
+  **947** (di nuovo la somma esatta) insieme, con i conteggi per client/proto
+  coerenti con l'unione. Verificati anche i casi limite: un id singolo senza
+  virgole resta `200` (retrocompatibilità), e segmenti vuoti in mezzo
+  (`?sessionId=id1,,id2`) vengono scartati senza alterare il risultato.
 
 #### Paginazione
 

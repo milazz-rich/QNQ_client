@@ -51,9 +51,12 @@ async def list_results(
         default=None,
         alias="sessionId",
         description=(
-            "Filtra per singola esecuzione di sessione. Preferito a "
-            "sessionItemIds per ottenere i risultati di UNA sessione: diretto e "
-            "senza ambiguità quando un SessionItem è condiviso fra più sessioni"
+            "Filtra per una o più esecuzioni di sessione: lista di id separati "
+            "da virgola, come sessionItemIds (un solo id è il caso degenere "
+            "di una lista con un elemento). Preferito a sessionItemIds per "
+            "ottenere i risultati di una o più sessioni specifiche: diretto e "
+            "senza ambiguità quando un SessionItem è condiviso fra più sessioni. "
+            "Più id si combinano in OR (unione), non in AND"
         ),
     ),
     client_id: str | None = Query(
@@ -91,10 +94,10 @@ async def list_results(
         scenario_path: valore di ``?scenarioPath=``, filtra per singolo scenario.
         session_item_ids: valore di ``?sessionItemIds=``, lista di id separati
             da virgola.
-        session_id: valore di ``?sessionId=``, filtra per la singola esecuzione
-            di sessione. È il filtro preferito per "i risultati di questa
-            sessione": ``sessionItemIds`` resta disponibile ma è ambiguo quando
-            uno stesso ``SessionItem`` è condiviso fra più sessioni.
+        session_id: valore di ``?sessionId=``, una o più sessioni, lista di id
+            separati da virgola (un solo id senza virgole è il caso degenere).
+            Più id si combinano in **OR**: l'unione dei risultati di ciascuna
+            sessione elencata, non l'intersezione.
         client_id: valore di ``?clientId=``, filtra per motore di misura.
         scenario_id: valore di ``?scenarioId=``, filtra per scenario.
         target_id: valore di ``?targetId=``, filtra per server sotto test.
@@ -106,22 +109,23 @@ async def list_results(
         ``200`` con un ``ResultPage``: ``items`` (la pagina, ordinata per
         istante di completamento crescente), ``total`` (quanti risultati
         soddisfano i filtri **in tutto**, non solo in questa pagina), più
-        ``page`` e ``pageSize`` applicati. I filtri si combinano in AND.
-        ``page`` oltre l'ultima pagina disponibile produce ``items`` vuoto e
-        ``total`` invariato, non un errore.
+        ``page`` e ``pageSize`` applicati. I filtri diversi si combinano in
+        AND; gli id dentro ``sessionId``/``sessionItemIds`` si combinano in OR
+        fra loro (§5.8 di AGENTS.md). ``page`` oltre l'ultima pagina
+        disponibile produce ``items`` vuoto e ``total`` invariato, non un
+        errore.
 
     Fa:
-        Spacchetta la lista comma-joined scartando i segmenti vuoti — così
+        Spacchetta le liste comma-joined scartando i segmenti vuoti — così
         ``?sessionItemIds=a,,b`` e un parametro vuoto non generano filtri
         spuri — e delega a ``results_service.list_results``, che restituisce
         pagina e totale in un'unica chiamata. ``page``/``pageSize`` fuori range
         sono respinti da FastAPI con ``422`` prima di arrivare al servizio.
     """
-    ids = _split_ids(session_item_ids)
     items, total = await results_service.list_results(
         scenario_path=scenario_path,
-        session_item_ids=ids,
-        session_id=session_id,
+        session_item_ids=_split_ids(session_item_ids),
+        session_ids=_split_ids(session_id),
         client_id=client_id,
         scenario_id=scenario_id,
         target_id=target_id,
@@ -150,7 +154,14 @@ async def aggregate_results(
     ),
     scenario_path: str | None = Query(default=None, alias="scenarioPath"),
     session_item_ids: str | None = Query(default=None, alias="sessionItemIds"),
-    session_id: str | None = Query(default=None, alias="sessionId"),
+    session_id: str | None = Query(
+        default=None,
+        alias="sessionId",
+        description=(
+            "Una o più sessioni, lista di id separati da virgola — stessa "
+            "semantica OR di GET /api/results"
+        ),
+    ),
     client_id: str | None = Query(default=None, alias="clientId"),
     scenario_id: str | None = Query(default=None, alias="scenarioId"),
     target_id: str | None = Query(default=None, alias="targetId"),
@@ -163,7 +174,8 @@ async def aggregate_results(
         metric: valore di ``?metric=`` — ``total``, ``ttfb`` o ``kb``.
         scenario_path, session_item_ids, session_id, client_id, scenario_id,
             target_id: gli **stessi** filtri di ``GET /api/results``, con la
-            stessa semantica (si combinano in AND).
+            stessa semantica (filtri diversi in AND, id multipli dentro
+            ``sessionId``/``sessionItemIds`` in OR).
 
     Restituisce:
         ``200`` con un ``ResultAggregate``: la dimensione e la metrica
@@ -185,7 +197,7 @@ async def aggregate_results(
         metric=metric,
         scenario_path=scenario_path,
         session_item_ids=_split_ids(session_item_ids),
-        session_id=session_id,
+        session_ids=_split_ids(session_id),
         client_id=client_id,
         scenario_id=scenario_id,
         target_id=target_id,

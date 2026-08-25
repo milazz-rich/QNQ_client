@@ -112,3 +112,13 @@ class SessionUpdate(MongoModel):
 
 class Session(SessionBase, MongoDocument):
     """Rappresentazione completa di una Session restituita dall'API."""
+
+    note: str | None = Field(
+        default=None,
+        description=(
+            "Nota di sistema, non impostabile da SessionCreate/SessionUpdate: "
+            "oggi valorizzata solo dal recupero da crash all'avvio (§5.1 di "
+            "AGENTS.md), per spiegare perché una sessione è 'failed' senza che "
+            "nessun item abbia effettivamente fallito una misura."
+        ),
+    )

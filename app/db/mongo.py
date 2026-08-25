@@ -7,7 +7,8 @@ from pymongo.errors import PyMongoError
 
 from app.core.config import settings
 from app.core.errors import DatabaseError
-from app.db.collections import RESULTS
+from app.db.collections import RESULTS, SESSIONS
+from app.models.session import RunStatus
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ async def connect_to_mongo() -> None:
 
 
 async def ensure_indexes() -> None:
-    """Crea gli indici della collezione ``results``, se non esistono già.
+    """Crea gli indici delle collezioni ``results`` e ``sessions``, se non esistono già.
 
     Riceve:
         Nulla.
@@ -68,17 +69,23 @@ async def ensure_indexes() -> None:
     Fa:
         ``create_index`` è idempotente: se l'indice esiste con la stessa
         definizione non fa nulla, quindi la funzione può girare a ogni avvio.
-        Gli indici sono **solo** su ``results`` perché è l'unica collezione che
+        Gli indici su ``results`` esistono perché è l'unica collezione che
         cresce senza limite (migliaia di documenti per sessione), mentre
         target, scenari e client restano nell'ordine delle decine e una
         scansione completa lì è più economica di un indice da mantenere.
+        L'indice su ``sessions`` non è invece per le prestazioni ma per
+        **integrità**: un indice unico parziale che vieta più di una Session
+        con ``status="running"`` contemporaneamente (§5.1 di AGENTS.md).
 
         Un fallimento viene registrato ma **non** blocca l'avvio, coerentemente
-        con ``connect_to_mongo``: senza indici l'applicazione funziona comunque,
-        solo più lentamente, e deve poter partire per essere diagnosticata.
+        con ``connect_to_mongo``: senza indici l'applicazione funziona comunque
+        (nel caso di ``results``, solo più lentamente; nel caso del vincolo su
+        ``sessions``, senza la garanzia atomica — resta comunque il controllo
+        applicativo in ``sessions_service.get_running_session``), e deve poter
+        partire per essere diagnosticata.
 
-        Le combinazioni scelte rispecchiano i filtri realmente usati da
-        ``results_service`` (vedi AGENTS.md §5.9).
+        Le combinazioni scelte per ``results`` rispecchiano i filtri realmente
+        usati da ``results_service`` (vedi AGENTS.md §5.9).
     """
     if _database is None:
         logger.warning("Indici non creati: connessione al database non inizializzata.")
@@ -109,6 +116,28 @@ async def ensure_indexes() -> None:
         logger.warning("Impossibile creare gli indici su '%s': %s", RESULTS, exc)
     else:
         logger.info("Indici su '%s' verificati.", RESULTS)
+
+    sessions_collection = _database[SESSIONS]
+    try:
+        # Al più una Session con status="running" in tutta la collezione: le
+        # misure sono sequenziali per metodologia (AGENTS.md §5.1), quindi due
+        # sessioni "running" contemporaneamente non sono uno stato valido, non
+        # solo uno sconsigliato. L'indice è parziale (si applica solo ai
+        # documenti con status="running", non a tutta la collezione) e rende
+        # la garanzia atomica a livello di database: un secondo tentativo di
+        # scrittura concorrente su un'altra sessione fallisce con
+        # DuplicateKeyError invece di lasciare una finestra di race fra un
+        # controllo applicativo e la scrittura successiva.
+        await sessions_collection.create_index(
+            [("status", 1)],
+            name="ix_single_running_session",
+            unique=True,
+            partialFilterExpression={"status": RunStatus.RUNNING.value},
+        )
+    except PyMongoError as exc:
+        logger.warning("Impossibile creare gli indici su '%s': %s", SESSIONS, exc)
+    else:
+        logger.info("Indici su '%s' verificati.", SESSIONS)
 
 
 async def close_mongo_connection() -> None:
