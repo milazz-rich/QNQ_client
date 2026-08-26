@@ -1360,6 +1360,47 @@ disponibile se servisse un'analisi più fine.
   comportamento di un browser reale.
 * **Più varianza.** L'avvio del processo browser introduce rumore assente in
   curl; conviene aumentare `reps` per compensare.
+* **`kb`, `total` e `ttfb` di Chrome/Firefox non sono comparabili nel tempo
+  su scenari HTTrack a catena** (Discord, GitHub, Microsoft, Twitch,
+  Wikipedia, Repubblica).
+  Confrontando due raccolte reali (17 e 24 agosto): curl è rimasto identico
+  su tutti gli scenari (~5,1–5,2 KB, variazione <1%), mentre Chrome è passato
+  da valori vicini a curl (~2,5–2,6 KB) a valori molto più alti e variabili
+  per scenario (da ~9,8 KB su Microsoft fino a ~358 KB su Wikipedia). Causa
+  identificata: fra le due raccolte è stata introdotta la logica di attesa e
+  selezione del "documento interno finale" per le catene di meta-refresh
+  HTTrack (oggi in `navigation.py`, condivisa fra Chrome e Firefox, §5.7).
+  Prima di quell'introduzione Chrome misurava presumibilmente solo il
+  documento indice iniziale — lo stub che fa da meta-refresh — non la pagina
+  interna reale verso cui reindirizza; da qui i ~2,5 KB, quasi certamente la
+  sola dimensione dello stub. curl non segue mai i meta-refresh (nessun
+  meccanismo equivalente a `-L` per un reindirizzamento via `<meta>`, che non
+  è un redirect HTTP), quindi resta ancorato allo stesso stub in entrambe le
+  raccolte — è per questo che è rimasto stabile mentre Chrome è cambiato.
+  **Implicazione per l'analisi**: i `kb` di Chrome (e Firefox, stessa logica
+  condivisa) misurati prima dell'introduzione di questa selezione non sono
+  confrontabili con quelli misurati dopo — un "andamento nel tempo dei byte
+  trasferiti" calcolato su un dataset che attraversa questo cambiamento
+  produrrebbe un numero senza significato. Il confronto resta valido solo
+  **entro un singolo dataset raccolto con la stessa versione del codice**,
+  oppure isolando curl, che non ha mai cambiato comportamento.
+
+  La stessa causa investe anche `total` e `ttfb`, non solo `kb`: la logica
+  di selezione del "documento interno finale" (§5.7) non cambia solo *quale*
+  documento viene misurato, ma fa sì che `total`/`ttfb` riflettano ora **due
+  richieste HTTP concatenate** (documento indice + documento interno finale)
+  invece di una sola. Prova dalla stessa coppia di raccolte (17 e 24 agosto):
+  il TTFB di Chrome è **crollato di ~3×** (27–33 ms → 9–11 ms) — coerente con
+  un secondo hop su una connessione già calda, quindi con un TTFB proprio
+  della seconda richiesta della catena, non della prima — mentre `total` ha
+  una variazione **molto irregolare per scenario** (da sostanzialmente
+  invariato fino a ×6,7 su GitHub), incompatibile con una spiegazione
+  generica come "più carico" o "più latenza di rete", che produrrebbe uno
+  spostamento uniforme fra gli scenari, non uno scenario-dipendente di
+  quell'ampiezza. curl, non seguendo mai il meta-refresh, misura sempre e
+  solo la singola richiesta verso lo stub: resta quindi comparabile **con sé
+  stesso** nel tempo, ma non con Chrome/Firefox su questi scenari specifici,
+  né prima né dopo l'introduzione della selezione del documento finale.
 
 #### Nota metodologica: `wait_until="load"`
 
