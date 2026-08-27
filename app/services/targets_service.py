@@ -5,7 +5,7 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
-from app.core.errors import DatabaseError, NotFoundError
+from app.core.errors import DatabaseError, NotFoundError, ValidationError
 from app.db.collections import TARGETS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
@@ -98,8 +98,6 @@ async def update_target(target_id: str, payload: TargetUpdate) -> Target:
         nella richiesta. Solleva ``NotFoundError`` se il target non esiste e
         ``ValidationError`` se il payload non contiene alcun campo.
     """
-    from app.core.errors import ValidationError
-
     collection = get_collection(TARGETS)
     object_id = to_object_id(target_id, "Id del target")
     changes = payload.model_dump(by_alias=True, mode="json", exclude_unset=True)

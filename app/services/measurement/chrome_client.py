@@ -21,6 +21,7 @@ con la misura del documento principale.
 
 import asyncio
 import logging
+from contextlib import suppress
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -34,22 +35,11 @@ logger = logging.getLogger(__name__)
 # Nome del motore nei messaggi d'errore prodotti da ``navigation``.
 _ENGINE = "Chrome"
 
-# Mappa il valore di ``response.protocol`` del CDP sul Protocol di dominio.
-# Solo h2 e h3 sono misure valide: "http/1.1" e qualunque altro valore restano
-# fuori da questa mappa e sono trattati come fallimento, esattamente come in
-# ``curl_client``. Serve perché Chrome, con --disable-quic su un server che non
-# parla HTTP/2, ripiega **in silenzio** su HTTP/1.1 rispondendo 200.
-_VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
-    "h2": Protocol.HTTP2,
-    "h3": Protocol.HTTP3,
-}
-
 # Margine, oltre il timeout di navigazione, concesso all'evento
 # ``Network.loadingFinished`` del documento: arriva subito dopo il termine
-# della navigazione, ma non necessariamente prima che ``goto`` ritorni.
+# della navigazione, ma non necessariamente prima che ``goto`` ritorni. È
+# specifico del CDP, quindi resta qui e non in ``navigation``.
 _LOADING_FINISHED_GRACE_MS = 2000
-_MAIN_FRAME_QUIET_MS = 250
-_MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
 
 
 class ChromeNavigationError(RuntimeError):
@@ -155,10 +145,12 @@ def _failed(error: str) -> Measurement:
 
 
 def _is_allowed_internal_navigation(target_url: str, candidate_url: str) -> bool:
+    """Applica la regola condivisa di navigazione interna col nome di questo motore."""
     return navigation.is_allowed_internal_navigation(target_url, candidate_url, _ENGINE)
 
 
 def _validate_navigation_chain(target_url: str, urls: list[str]) -> None:
+    """Solleva l'eccezione di dominio Chrome se la catena esce dal contenuto misurato."""
     disallowed = navigation.find_disallowed_navigation(target_url, urls, _ENGINE)
     if disallowed is not None:
         raise ChromeNavigationError(
@@ -174,11 +166,13 @@ async def _wait_for_main_frame_quiet(
     target_url: str,
 ) -> None:
     """Attende una finestra bounded di quiete della catena main-frame."""
-    deadline = asyncio.get_running_loop().time() + (_MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000)
+    deadline = asyncio.get_running_loop().time() + (
+        navigation.MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000
+    )
     previous_count = len(main_frame_urls) - mark
 
     while True:
-        await asyncio.sleep(_MAIN_FRAME_QUIET_MS / 1000)
+        await asyncio.sleep(navigation.MAIN_FRAME_QUIET_MS / 1000)
         current_count = len(main_frame_urls) - mark
         _validate_navigation_chain(target_url, main_frame_urls[mark:])
         if current_count == previous_count:
@@ -190,13 +184,15 @@ async def _wait_for_main_frame_quiet(
             raise ChromeNavigationError(
                 "Timeout durante la stabilizzazione della catena main-frame Chrome."
             )
-        try:
+        # Un'attesa scaduta o interrotta non è un errore: serve solo a dare
+        # tempo alla catena di stabilizzarsi, e il ciclo verifica comunque la
+        # condizione di uscita al giro successivo. Stessa forma usata da
+        # ``firefox_client`` nel punto equivalente.
+        with suppress(Exception):
             await page.wait_for_load_state(
                 settings.chrome_wait_until,
                 timeout=min(remaining_ms, 500),
             )
-        except Exception:
-            pass
 
 
 def _final_document_response(
@@ -237,7 +233,7 @@ def _to_measurement(response: dict[str, Any], finished: dict[str, Any]) -> Measu
         popolato sempre, anche sui fallimenti.
     """
     raw_protocol = str(response.get("protocol", ""))
-    negotiated = _VALID_NEGOTIATED_PROTOCOLS.get(raw_protocol)
+    negotiated = navigation.VALID_NEGOTIATED_PROTOCOLS.get(raw_protocol)
     status = int(response.get("status", 0) or 0)
     timing = response.get("timing") or {}
     got_response = status > 0 and bool(timing)

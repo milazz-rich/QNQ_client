@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from app.models.common import Protocol
-from app.services.measurement import firefox_client
+from app.services.measurement import firefox_client, navigation
 
 
 class FakePage:
@@ -138,8 +138,8 @@ class FirefoxClientTests(unittest.TestCase):
         self.assertEqual(page.goto_calls, 0)
 
     def test_navigation_timing_retries_context_destroyed_only(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
         page = FakePage(
             [
                 Exception(
@@ -161,7 +161,7 @@ class FirefoxClientTests(unittest.TestCase):
                 )
             )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
 
         self.assertEqual(entry["nextHopProtocol"], "h3")
         self.assertEqual(page.evaluate_calls, 2)
@@ -185,8 +185,8 @@ class FirefoxClientTests(unittest.TestCase):
         self.assertEqual(page.evaluate_calls, 1)
 
     def test_navigation_timing_respects_max_retry_count(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
         error = Exception(
             "Page.evaluate: Execution context was destroyed, "
             "most likely because of a navigation"
@@ -205,13 +205,13 @@ class FirefoxClientTests(unittest.TestCase):
                     )
                 )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
 
         self.assertEqual(page.evaluate_calls, firefox_client._NAVIGATION_TIMING_RETRIES)
 
     def test_internal_httrack_navigation_is_accepted(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
         page = FakePage([{"nextHopProtocol": "h3", "transferSize": 512}])
         tracker = FakeTracker(
             [2],
@@ -231,15 +231,15 @@ class FirefoxClientTests(unittest.TestCase):
                 )
             )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
 
         self.assertEqual(entry["nextHopProtocol"], "h3")
         self.assertEqual(page.evaluate_calls, 1)
         self.assertEqual(page.goto_calls, 0)
 
     def test_external_main_frame_navigation_fails(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
         page = FakePage([{"nextHopProtocol": "h3", "transferSize": 512}])
         tracker = FakeTracker(
             [2],
@@ -260,14 +260,14 @@ class FirefoxClientTests(unittest.TestCase):
                     )
                 )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
 
         self.assertEqual(page.evaluate_calls, 0)
         self.assertEqual(page.goto_calls, 0)
 
     def test_navigation_timing_recovers_after_internal_navigation_context_destroyed(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
         page = FakePage(
             [
                 Exception(
@@ -295,7 +295,7 @@ class FirefoxClientTests(unittest.TestCase):
                 )
             )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
 
         self.assertEqual(entry["nextHopProtocol"], "h3")
         self.assertEqual(page.evaluate_calls, 2)
@@ -335,10 +335,10 @@ class FirefoxClientTests(unittest.TestCase):
         )
 
     def test_main_frame_stability_timeout_fails(self) -> None:
-        original_quiet = firefox_client._MAIN_FRAME_QUIET_MS
-        original_timeout = firefox_client._MAIN_FRAME_SETTLE_TIMEOUT_MS
-        firefox_client._MAIN_FRAME_QUIET_MS = 0
-        firefox_client._MAIN_FRAME_SETTLE_TIMEOUT_MS = 0
+        original_quiet = navigation.MAIN_FRAME_QUIET_MS
+        original_timeout = navigation.MAIN_FRAME_SETTLE_TIMEOUT_MS
+        navigation.MAIN_FRAME_QUIET_MS = 0
+        navigation.MAIN_FRAME_SETTLE_TIMEOUT_MS = 0
         page = FakePage([])
         tracker = FakeTracker(
             [1, 2],
@@ -359,8 +359,8 @@ class FirefoxClientTests(unittest.TestCase):
                     )
                 )
         finally:
-            firefox_client._MAIN_FRAME_QUIET_MS = original_quiet
-            firefox_client._MAIN_FRAME_SETTLE_TIMEOUT_MS = original_timeout
+            navigation.MAIN_FRAME_QUIET_MS = original_quiet
+            navigation.MAIN_FRAME_SETTLE_TIMEOUT_MS = original_timeout
 
     def test_measurement_uses_navigation_timing_entry_for_final_document(self) -> None:
         measurement = firefox_client._to_measurement(

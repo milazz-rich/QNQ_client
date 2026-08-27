@@ -7,6 +7,8 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
+from app.core.errors import ValidationError
+
 
 class Protocol(StrEnum):
     """Protocollo applicativo sotto confronto.
@@ -131,8 +133,6 @@ def to_object_id(value: str, what: str = "Identificativo") -> ObjectId:
         Solleva ``ValidationError`` applicativa (HTTP 422) se la stringa non è un
         ObjectId valido, invece di lasciar propagare ``InvalidId`` come 500.
     """
-    from app.core.errors import ValidationError
-
     try:
         return ObjectId(value)
     except (InvalidId, TypeError) as exc:

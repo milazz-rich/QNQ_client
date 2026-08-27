@@ -8,7 +8,7 @@ import logging
 
 from pymongo.errors import PyMongoError
 
-from app.core.errors import DatabaseError
+from app.core.errors import DatabaseError, NotFoundError
 from app.db.collections import RESULTS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
@@ -318,8 +318,6 @@ async def get_result(result_id: str) -> Result:
         Converte l'id in ``ObjectId`` (``ValidationError`` se malformato) e
         solleva ``NotFoundError`` se il documento non esiste.
     """
-    from app.core.errors import NotFoundError
-
     collection = get_collection(RESULTS)
     object_id = to_object_id(result_id, "Id del risultato")
     try:
@@ -374,7 +372,9 @@ async def delete_results_by_session(session_id: str) -> int:
         delete_result = await collection.delete_many({"sessionId": session_id})
     except PyMongoError as exc:
         raise DatabaseError("Impossibile eliminare i risultati della sessione.") from exc
-    logger.info("Risultati eliminati per la sessione %s: %d", session_id, delete_result.deleted_count)
+    logger.info(
+        "Risultati eliminati per la sessione %s: %d", session_id, delete_result.deleted_count
+    )
     return delete_result.deleted_count
 
 

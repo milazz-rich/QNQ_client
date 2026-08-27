@@ -80,7 +80,10 @@ class SessionBase(MongoModel):
     )
     reps: int = Field(ge=1, description="Ripetizioni per item, uguali per tutta la sessione")
     timeout: int = Field(
-        ge=1, description="Timeout della singola richiesta in millisecondi, uguale per tutta la sessione"
+        ge=1,
+        description=(
+            "Timeout della singola richiesta in millisecondi, uguale per tutta la sessione"
+        ),
     )
     when: datetime = Field(description="Istante di pianificazione o avvio, in UTC")
     status: RunStatus = Field(default=RunStatus.PENDING, description="Stato della sessione")

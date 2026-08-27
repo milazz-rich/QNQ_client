@@ -53,23 +53,6 @@ _handler: "SessionFileHandler | None" = None
 _install_guard = threading.Lock()
 
 
-def current_session_id() -> str | None:
-    """Restituisce l'id della sessione in esecuzione nel contesto corrente.
-
-    Riceve:
-        Nulla.
-
-    Restituisce:
-        L'id della sessione, o ``None`` fuori da un'esecuzione.
-
-    Fa:
-        Legge la ``ContextVar``. Esposta soprattutto per i test e per la
-        diagnostica: il codice applicativo non deve consultarla, è l'handler a
-        farlo per conto suo.
-    """
-    return _current_session_id.get()
-
-
 def session_log_path(session_id: str) -> Path:
     """Compone il percorso del file di log di una sessione.
 

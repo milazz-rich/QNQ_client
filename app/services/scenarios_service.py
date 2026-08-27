@@ -5,7 +5,7 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
-from app.core.errors import DatabaseError, NotFoundError
+from app.core.errors import DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SCENARIOS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
@@ -98,8 +98,6 @@ async def update_scenario(scenario_id: str, payload: ScenarioUpdate) -> Scenario
         nella richiesta. Solleva ``NotFoundError`` se lo scenario non esiste e
         ``ValidationError`` se il payload non contiene alcun campo.
     """
-    from app.core.errors import ValidationError
-
     collection = get_collection(SCENARIOS)
     object_id = to_object_id(scenario_id, "Id dello scenario")
     changes = payload.model_dump(by_alias=True, mode="json", exclude_unset=True)

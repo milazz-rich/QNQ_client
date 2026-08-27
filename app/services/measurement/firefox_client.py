@@ -57,16 +57,9 @@ _BROWSER_CLOSE_TIMEOUT_S = 15.0
 # navigazione, concesso all'avvio del browser in ciascun tentativo.
 _PROFILE_PREPARATION_ATTEMPTS = 2
 _PROFILE_PREPARATION_GRACE_MS = 30_000
-_MAIN_FRAME_QUIET_MS = 250
-_MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
 _EXECUTION_CONTEXT_DESTROYED = (
     "Execution context was destroyed, most likely because of a navigation"
 )
-
-_VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
-    "h2": Protocol.HTTP2,
-    "h3": Protocol.HTTP3,
-}
 
 _NAVIGATION_ENTRY_JS = """() => {
     const entry = performance.getEntriesByType('navigation')[0];
@@ -86,16 +79,12 @@ class NavigationTimingError(RuntimeError):
     """Errore recuperabile solo come misura fallita, non come eccezione al runner."""
 
 
-class AdditionalMainFrameNavigationError(NavigationTimingError):
-    """Indica una nuova navigazione del main frame dopo quella misurata."""
-
-
 class ExternalMainFrameNavigationError(NavigationTimingError):
     """Indica una navigazione main-frame fuori dal contenuto QNQ misurato."""
 
 
 class MainFrameStabilityTimeoutError(NavigationTimingError):
-    """Indica che la catena main-frame non si e stabilizzata nel tempo massimo."""
+    """Indica che la catena main-frame non si è stabilizzata nel tempo massimo."""
 
 
 @dataclass(frozen=True)
@@ -533,11 +522,13 @@ async def _wait_for_main_frame_quiet(
     target_url: str,
 ) -> None:
     """Attende brevemente che emergano navigazioni main-frame immediate."""
-    deadline = asyncio.get_running_loop().time() + (_MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000)
+    deadline = asyncio.get_running_loop().time() + (
+        navigation.MAIN_FRAME_SETTLE_TIMEOUT_MS / 1000
+    )
     previous_count = tracker.count_since(mark)
 
     while True:
-        await asyncio.sleep(_MAIN_FRAME_QUIET_MS / 1000)
+        await asyncio.sleep(navigation.MAIN_FRAME_QUIET_MS / 1000)
         current_count = tracker.count_since(mark)
         _validate_navigation_chain(target_url, tracker.urls_since(mark))
         if current_count == previous_count:
@@ -612,7 +603,9 @@ def _final_navigation_record(
     )
 
 
-def _entry_matches_navigation(entry: dict[str, Any] | None, record: MainFrameNavigationRecord) -> bool:
+def _entry_matches_navigation(
+    entry: dict[str, Any] | None, record: MainFrameNavigationRecord
+) -> bool:
     entry_name = str((entry or {}).get("name") or "")
     return not entry_name or entry_name == record.url
 
@@ -841,7 +834,7 @@ def _to_measurement(
 ) -> Measurement:
     """Converte i dati di Navigation/Resource Timing nel modello di dominio."""
     raw_protocol = str((entry or {}).get("nextHopProtocol") or "")
-    negotiated = _VALID_NEGOTIATED_PROTOCOLS.get(raw_protocol)
+    negotiated = navigation.VALID_NEGOTIATED_PROTOCOLS.get(raw_protocol)
     got_response = status > 0 and entry is not None
     protocol_ok = got_response and negotiated is requested
     succeeded = protocol_ok and is_http_success(status)

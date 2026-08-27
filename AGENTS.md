@@ -33,55 +33,60 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
 ├── .env.example               # template versionato
 ├── requirements.txt
 ├── main.py                    # entrypoint di comodo: importa app.main:app
-└── app/
-    ├── main.py                # costruzione dell'app FastAPI (factory + lifespan)
-    ├── core/
-    │   ├── config.py          # Settings da .env (pydantic-settings)
-    │   ├── cors.py            # configurazione CORS
-    │   ├── errors.py          # eccezioni applicative + exception handlers
-    │   └── session_logging.py # cattura su file dei log per sessione (§5.10)
-    ├── db/
-    │   ├── mongo.py           # ciclo di vita della connessione motor + indici
-    │   └── collections.py     # nomi delle collezioni (costanti)
-    ├── models/                # Pydantic models, un file per entità + barrel
-    │   ├── __init__.py        # barrel: riesporta tutti i modelli
-    │   ├── common.py          # tipi condivisi (PyObjectId, MongoModel, ErrorResponse)
-    │   ├── target.py
-    │   ├── scenario.py
-    │   ├── client.py
-    │   ├── session_item.py
-    │   ├── session.py
-    │   └── result.py
-    ├── routers/               # un file per entità, solo HTTP
-    │   ├── __init__.py
-    │   ├── health.py
-    │   ├── targets.py
-    │   ├── scenarios.py
-    │   ├── clients.py
-    │   ├── session_items.py
-    │   ├── sessions.py
-    │   └── results.py
-    └── services/              # logica di business, zero dipendenze da FastAPI
-        ├── __init__.py
-        ├── targets_service.py
-        ├── scenarios_service.py
-        ├── clients_service.py
-        ├── session_items_service.py
-        ├── sessions_service.py
-        ├── results_service.py
-        ├── measurement/       # esecuzione delle misure HTTP/2 e HTTP/3
-        │   ├── __init__.py
-        │   ├── curl_client.py   # motore "curl": processo esterno + parsing -w
-        │   ├── chrome_client.py # motore "chrome": Playwright + CDP
-        │   ├── firefox_client.py # motore "firefox": Playwright + Resource Timing
-        │   ├── navigation.py    # regole di catena main-frame, condivise fra i browser
-        │   └── runner.py        # entità del dominio → motore → Result
-        └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
+├── app/
+│   ├── main.py                # costruzione dell'app FastAPI (factory + lifespan)
+│   ├── core/
+│   │   ├── config.py          # Settings da .env (pydantic-settings)
+│   │   ├── cors.py            # configurazione CORS
+│   │   ├── errors.py          # eccezioni applicative + exception handlers
+│   │   └── session_logging.py # cattura su file dei log per sessione (§5.10)
+│   ├── db/
+│   │   ├── mongo.py           # ciclo di vita della connessione motor + indici
+│   │   └── collections.py     # nomi delle collezioni (costanti)
+│   ├── models/                # Pydantic models, un file per entità + barrel
+│   │   ├── __init__.py        # barrel: riesporta tutti i modelli
+│   │   ├── common.py          # tipi condivisi (MongoId, MongoModel, ErrorResponse)
+│   │   ├── target.py
+│   │   ├── scenario.py
+│   │   ├── client.py
+│   │   ├── session_item.py
+│   │   ├── session.py
+│   │   └── result.py
+│   ├── routers/               # un file per entità, solo HTTP
+│   │   ├── __init__.py
+│   │   ├── health.py
+│   │   ├── targets.py
+│   │   ├── scenarios.py
+│   │   ├── clients.py
+│   │   ├── session_items.py
+│   │   ├── sessions.py
+│   │   └── results.py
+│   └── services/              # logica di business, zero dipendenze da FastAPI
+│       ├── __init__.py
+│       ├── targets_service.py
+│       ├── scenarios_service.py
+│       ├── clients_service.py
+│       ├── session_items_service.py
+│       ├── sessions_service.py
+│       ├── results_service.py
+│       ├── measurement/       # esecuzione delle misure HTTP/2 e HTTP/3
+│       │   ├── __init__.py
+│       │   ├── curl_client.py    # motore "curl": processo esterno + parsing -w
+│       │   ├── chrome_client.py  # motore "chrome": Playwright + CDP
+│       │   ├── firefox_client.py # motore "firefox": Playwright + Resource Timing
+│       │   ├── navigation.py     # regole e costanti di catena main-frame, condivise
+│       │   └── runner.py         # entità del dominio → motore → Result
+│       └── session_runner.py  # orchestrazione dell'esecuzione di una sessione
 ├── tests/
-│   ├── test_chrome_client.py       # test unitari del client Chrome
-│   ├── test_firefox_client.py      # test unitari del client Firefox
-│   ├── test_measurement_cleanup.py # garanzie di cleanup e coerenza fra motori
-│   └── test_session_logging.py     # correlazione e isolamento dei log di sessione
+│   ├── test_chrome_client.py          # test unitari del client Chrome
+│   ├── test_firefox_client.py         # test unitari del client Firefox
+│   ├── test_measurement_cleanup.py    # garanzie di cleanup e coerenza fra motori
+│   ├── test_session_concurrency.py    # lock su sessioni concorrenti e recupero da crash (§5.1)
+│   ├── test_session_items_orphaned.py # identificazione e pulizia dei SessionItem orfani (§5.5)
+│   └── test_session_logging.py        # correlazione e isolamento dei log di sessione
+├── docs/
+│   ├── ARCHITETTURA.md        # spiegazione ragionata dell'architettura (per la tesi)
+│   └── reports/               # report di analisi delle campagne di misura
 ├── .runtime/                  # profili Firefox (NON versionato, §5.7)
 └── logs/sessions/             # un file di log per sessione (NON versionato, §5.10)
 ```
@@ -91,11 +96,12 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
 > il protocollo è **un solo flag di curl** (`--http2` / `--http3`), quindi due
 > moduli sarebbero stati identici a meno di una riga. La differenza è confinata
 > in `curl_client._protocol_flag`. La divisione reale è **per motore di misura**
-> (`curl_client`, `chrome_client`: ciascuno parla con il proprio processo
-> esterno) e **per responsabilità** (`runner` parla con il dominio e sceglie il
-> motore, senza sapere come questo lavori). I motori espongono lo stesso
-> contratto `measure(url, protocol, timeout_ms) -> Measurement` e sono
-> registrati in `runner.MEASUREMENT_BACKENDS`.
+> (`curl_client`, `chrome_client`, `firefox_client`: ciascuno parla con il
+> proprio processo esterno) e **per responsabilità** (`runner` parla con il
+> dominio e sceglie il motore, senza sapere come questo lavori). I motori
+> espongono lo stesso contratto
+> `measure(url, protocol, timeout_ms) -> Measurement` e sono registrati in
+> `runner.MEASUREMENT_BACKENDS`.
 >
 > `navigation.py` è l'eccezione a "un file per motore": contiene le regole con
 > cui Chrome e Firefox decidono quali navigazioni main-frame automatiche
@@ -106,6 +112,16 @@ sul repository: struttura, modello dati e convenzioni **precedono** il codice.
 > significato senza che nulla lo segnali. Ogni client conserva la propria
 > eccezione di dominio, perché il messaggio finisce in `Result.error` e deve
 > nominare il motore che ha rifiutato la misura.
+>
+> Per la stessa ragione il modulo ospita anche le **costanti** condivise dai due
+> motori browser: `VALID_NEGOTIATED_PROTOCOLS` (quali protocolli negoziati
+> costituiscono una misura valida — solo `h2`/`h3`) e
+> `MAIN_FRAME_QUIET_MS` / `MAIN_FRAME_SETTLE_TIMEOUT_MS` (quanto si attende la
+> stabilizzazione della catena). Anche queste determinano *quale documento*
+> viene misurato su una catena di meta-refresh HTTrack, quindi una loro
+> divergenza silenziosa avrebbe le stesse conseguenze. `curl_client` mantiene
+> invece una mappa propria, perché le sue chiavi sono i valori di
+> `%{http_version}` (`"2"` / `"3"`) e non le sigle ALPN dei browser.
 
 ### Regola di stratificazione
 
@@ -576,6 +592,18 @@ async def get_target(target_id: str) -> Target:
 Formato: prima riga imperativa e sintetica, poi riga vuota, poi le tre sezioni
 `Riceve:` / `Restituisce:` / `Fa:`. Documentare anche le eccezioni sollevate
 dentro `Fa:`.
+
+**Ambito della regola.** Le tre sezioni sono obbligatorie su tutta la superficie
+pubblica — funzioni di router, funzioni di service invocate da fuori del modulo,
+entry point dei motori di misura (`measure`, `build_url`, `cleanup_stale_run_profiles`,
+…) — cioè ovunque il chiamante non veda il corpo della funzione. I piccoli helper
+privati (`_netloc`, `_altsvc_file`, `_is_allowed_internal_navigation`, …) usano
+invece una **sola riga** di sommario: sono di poche righe, il corpo è già la
+spiegazione più chiara, e tre sezioni di prosa per un `return f"{host}:{port}"`
+aggiungerebbero rumore, non leggibilità. Restano comunque obbligatori i type
+hints (§4.2) e una riga di docstring quando il *perché* non è ovvio dal corpo —
+è il caso di `_remove_tree` o `_close_quietly`, che documentano per esteso
+perché non devono mai propagare eccezioni.
 
 ### 4.2 Stile
 

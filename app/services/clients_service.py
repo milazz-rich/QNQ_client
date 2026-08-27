@@ -5,7 +5,7 @@ import logging
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
-from app.core.errors import DatabaseError, NotFoundError
+from app.core.errors import DatabaseError, NotFoundError, ValidationError
 from app.db.collections import CLIENTS
 from app.db.mongo import get_collection
 from app.models.client import Client, ClientCreate, ClientUpdate
@@ -98,8 +98,6 @@ async def update_client(client_id: str, payload: ClientUpdate) -> Client:
         nella richiesta. Solleva ``NotFoundError`` se il client non esiste e
         ``ValidationError`` se il payload non contiene alcun campo.
     """
-    from app.core.errors import ValidationError
-
     collection = get_collection(CLIENTS)
     object_id = to_object_id(client_id, "Id del client")
     changes = payload.model_dump(by_alias=True, mode="json", exclude_unset=True)

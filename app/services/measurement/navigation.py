@@ -14,9 +14,35 @@ garantire — perderebbe significato senza che nulla lo segnali.
 I due client conservano invece la propria eccezione di dominio: il messaggio
 d'errore finisce in ``Result.error`` e deve dire quale motore ha rifiutato la
 navigazione.
+
+Per la stessa ragione vivono qui anche le **costanti** che definiscono cosa
+conta come misura valida e quanto si attende la catena: erano duplicate
+verbatim nei due client, dove nulla avrebbe segnalato una loro divergenza.
 """
 
 from urllib.parse import SplitResult, urlsplit
+
+from app.models.common import Protocol
+
+# Protocolli negoziati che costituiscono una misura valida, per **entrambi** i
+# motori browser. Solo h2 e h3: "http/1.1" e qualunque altro valore restano
+# fuori da questa mappa e sono trattati come fallimento, esattamente come in
+# ``curl_client``. Serve perché un browser può ripiegare **in silenzio** su
+# HTTP/1.1 rispondendo 200 (Chrome con --disable-quic su un server che non
+# parla h2), e una misura del protocollo sbagliato non è una misura valida.
+VALID_NEGOTIATED_PROTOCOLS: dict[str, Protocol] = {
+    "h2": Protocol.HTTP2,
+    "h3": Protocol.HTTP3,
+}
+
+# Attesa della catena main-frame dopo la navigazione misurata: si considera
+# stabile quando passa un intervallo di quiete senza nuove navigazioni, entro
+# un tetto massimo complessivo. Condivise fra i due motori perché determinano
+# **quale documento** viene misurato su una catena di meta-refresh HTTrack: due
+# finestre di attesa diverse potrebbero far fermare un motore sul documento
+# indice e l'altro su quello interno finale (§5.6, §5.7).
+MAIN_FRAME_QUIET_MS = 250
+MAIN_FRAME_SETTLE_TIMEOUT_MS = 2500
 
 
 def split_url(url: str, engine: str) -> SplitResult:

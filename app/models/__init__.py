@@ -11,7 +11,17 @@ from app.models.common import (
     Protocol,
     to_object_id,
 )
-from app.models.result import Result, ResultBase, ResultCreate, ResultStatus
+from app.models.result import (
+    AggregateDimension,
+    AggregateMetric,
+    Result,
+    ResultAggregate,
+    ResultAggregateGroup,
+    ResultBase,
+    ResultCreate,
+    ResultPage,
+    ResultStatus,
+)
 from app.models.scenario import Scenario, ScenarioBase, ScenarioCreate, ScenarioUpdate
 from app.models.session import (
     RunStatus,
@@ -22,6 +32,8 @@ from app.models.session import (
     SessionUpdate,
 )
 from app.models.session_item import (
+    OrphanedSessionItem,
+    OrphanedSessionItemsDeleteResult,
     SessionItem,
     SessionItemBase,
     SessionItemBatchCreate,
@@ -66,6 +78,8 @@ __all__ = [
     "ClientCreate",
     "ClientUpdate",
     # session item
+    "OrphanedSessionItem",
+    "OrphanedSessionItemsDeleteResult",
     "SessionItem",
     "SessionItemBase",
     "SessionItemBatchCreate",
@@ -80,8 +94,13 @@ __all__ = [
     "SessionProgressItem",
     "SessionUpdate",
     # result
+    "AggregateDimension",
+    "AggregateMetric",
     "Result",
+    "ResultAggregate",
+    "ResultAggregateGroup",
     "ResultBase",
     "ResultCreate",
+    "ResultPage",
     "ResultStatus",
 ]

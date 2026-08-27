@@ -49,9 +49,8 @@ class ResultBase(MongoModel):
         description=(
             "Client (motore di misura) che ha prodotto il risultato. "
             "Riferimento diretto per la stessa ragione di targetId: consente di "
-            "confrontare o filtrare le misure per motore (curl, Chrome, Firefox) "
-            "senza "
-            "doverlo dedurre risalendo al SessionItem."
+            "confrontare o filtrare le misure per motore (curl, Chrome, "
+            "Firefox) senza doverlo dedurre risalendo al SessionItem."
         ),
     )
     scenario_id: MongoId = Field(

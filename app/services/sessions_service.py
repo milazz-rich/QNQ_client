@@ -11,9 +11,23 @@ from app.db.collections import SESSIONS
 from app.db.mongo import get_collection
 from app.models.common import to_object_id
 from app.models.session import RunStatus, Session, SessionCreate, SessionUpdate
-from app.services import results_service, session_items_service
+from app.services import results_service
 
 logger = logging.getLogger(__name__)
+
+# Messaggio del 409 prodotto quando la scrittura viola l'indice unico parziale
+# ``ix_single_running_session``. Vive qui, e non duplicato nei due punti che lo
+# sollevano (``set_status`` e ``update_session``), perché è la **stessa**
+# condizione vista da due strade diverse: due testi che divergessero farebbero
+# sembrare al client due errori distinti dove ce n'è uno solo. È deliberatamente
+# più generico del messaggio del router (§5.1): a questo livello la race è già
+# avvenuta e non si sa più quale sessione l'abbia vinta, quindi non si può
+# nominare quella bloccante.
+_ALREADY_RUNNING_MESSAGE = (
+    "Un'altra sessione è già in esecuzione: le misure di questo "
+    "progetto sono sequenziali per metodologia (AGENTS.md §5.1), non "
+    "è possibile eseguirne due contemporaneamente."
+)
 
 
 async def get_running_session() -> Session | None:
@@ -205,11 +219,7 @@ async def update_session(session_id: str, payload: SessionUpdate) -> Session:
             return_document=ReturnDocument.AFTER,
         )
     except DuplicateKeyError as exc:
-        raise ConflictError(
-            "Un'altra sessione è già in esecuzione: le misure di questo "
-            "progetto sono sequenziali per metodologia (AGENTS.md §5.1), non "
-            "è possibile eseguirne due contemporaneamente."
-        ) from exc
+        raise ConflictError(_ALREADY_RUNNING_MESSAGE) from exc
     except PyMongoError as exc:
         raise DatabaseError("Impossibile aggiornare la sessione.") from exc
     if document is None:
@@ -340,11 +350,7 @@ async def set_status(session_id: str, status: RunStatus) -> None:
     try:
         await collection.update_one({"_id": object_id}, {"$set": {"status": status.value}})
     except DuplicateKeyError as exc:
-        raise ConflictError(
-            "Un'altra sessione è già in esecuzione: le misure di questo "
-            "progetto sono sequenziali per metodologia (AGENTS.md §5.1), non "
-            "è possibile eseguirne due contemporaneamente."
-        ) from exc
+        raise ConflictError(_ALREADY_RUNNING_MESSAGE) from exc
     except PyMongoError as exc:
         raise DatabaseError("Impossibile aggiornare lo stato della sessione.") from exc
 

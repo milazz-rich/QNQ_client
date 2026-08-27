@@ -11,8 +11,6 @@ from app.core.cors import setup_cors
 from app.core.errors import register_exception_handlers
 from app.core.session_logging import LOG_FORMAT, setup_session_logging
 from app.db.mongo import close_mongo_connection, connect_to_mongo, ensure_indexes
-from app.services import sessions_service
-from app.services.measurement.firefox_client import cleanup_stale_run_profiles
 from app.routers import (
     clients,
     health,
@@ -22,6 +20,8 @@ from app.routers import (
     sessions,
     targets,
 )
+from app.services import sessions_service
+from app.services.measurement.firefox_client import cleanup_stale_run_profiles
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)

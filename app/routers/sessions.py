@@ -8,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, Path, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from app.core.errors import ConflictError
+from app.core.errors import ConflictError, ValidationError
 from app.models.common import ErrorResponse
 from app.models.session import RunStatus, Session, SessionCreate, SessionUpdate
 from app.services import session_runner, sessions_service
@@ -137,8 +137,6 @@ async def start_session(
         comunque in ``ConflictError``, solo con un messaggio più generico
         perché a quel punto non sappiamo più quale sessione ha vinto.
     """
-    from app.core.errors import ValidationError
-
     session = await sessions_service.get_session(session_id)
     if session.status is RunStatus.RUNNING:
         raise ConflictError(f"La sessione '{session_id}' è già in esecuzione.")

@@ -2,10 +2,9 @@
 
 import logging
 
+from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
-
-from bson import ObjectId
 
 from app.core.errors import ConflictError, DatabaseError, NotFoundError, ValidationError
 from app.db.collections import SESSION_ITEMS, SESSIONS
